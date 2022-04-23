@@ -1,0 +1,11 @@
+{
+  "name": "Vapor",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedFirst": {
+      "$ignoreUnknownInstances": true,
+      "$className": "ReplicatedFirst",
+      "Vapor": {"$path": "src"}
+    }
+  }
+}
