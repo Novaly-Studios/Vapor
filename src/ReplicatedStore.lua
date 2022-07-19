@@ -165,7 +165,8 @@ function ReplicatedStore:InitClient()
             end
 
             for _, Call in Data do
-                self[Call.Method](self, unpack(Call.Args))
+                --self[Call.Method](self, unpack(Call.Args))
+                self[Call[1]](self, unpack(Call[2]))
             end
         debug.profileend()
     end)
@@ -405,24 +406,18 @@ function ReplicatedStore:_PrepareDefer(SendToCategory: string, Method: string, .
         local LastCall = InstructionList[#InstructionList]
         local LastMerge
 
-        if (LastCall and LastCall.Method == ShortenedMergeName) then
-            LastMerge = LastCall.Args[1]
+        if (LastCall and LastCall[1] == ShortenedMergeName) then
+            LastMerge = LastCall[2][1]
         end
 
         if (LastMerge) then
             InternalMerge(MergeIn, LastMerge, true)
         else
-            table.insert(InstructionList, {
-                Method = Method;
-                Args = {MergeIn};
-            })
+            table.insert(InstructionList, {Method, {MergeIn}})
         end
     else
         -- Non-merge calls deoptimize the above, but it has to happen to avoid desync
-        table.insert(InstructionList, {
-            Method = Method;
-            Args = {...};
-        })
+        table.insert(InstructionList, {Method, {...}})
     end
 
     -- Activate next defer function
@@ -493,11 +488,9 @@ end
 --- Fully syncs this store's data down to a specific client who requests it.
 --- Blocks subsequent calls to ensure exploiters cannot overload the server.
 function ReplicatedStore:_FullSync(Player: Player, InitialSync: boolean)
+    local Package = {{METHOD_SHORTENINGS.Merge, {ConvertToStringIndices(self:GetUsingPathString())}}}
+
     if (self._TestMode) then
-        local Package = {{
-            Method = "Merge";
-            Args = {ConvertToStringIndices(self:GetUsingPathString())};
-        }}
         self._RemoteEvent:FireClient(Player, Package, InitialSync)
         return
     end
@@ -521,10 +514,6 @@ function ReplicatedStore:_FullSync(Player: Player, InitialSync: boolean)
         SyncedPlayers[UserID] = nil
     end)
 
-    local Package = {{
-        Method = "Merge";
-        Args = {ConvertToStringIndices(self:GetUsingPathString())};
-    }}
     self._RemoteEvent:FireClient(Player, Package, InitialSync)
 end
 
