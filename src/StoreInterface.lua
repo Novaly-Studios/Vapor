@@ -1,154 +1,121 @@
---!nonstrict
-local TableUtil = require(script.Parent.Parent:WaitForChild("TableUtil"))
-    local Array = TableUtil.Array
-        local Merge1D = Array.Merge1D
+local TypeGuard = require(script.Parent.Parent:WaitForChild("TypeGuard"))
 local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
-local Signal = require(script.Parent.Parent:WaitForChild("Signal"))
-    type Signal<T> = Signal.Type<T>
-local Store = require(script.Parent:WaitForChild("GeneralStore"))
-    type StorePath = Store.StorePath
+local XSignal = require(script.Parent.Parent:WaitForChild("XSignal"))
+    type Signal<T> = XSignal.XSignal<T>
 
+local Shared = require(script.Parent:WaitForChild("Shared"))
+    local RemoveNode = Shared.RemoveNode
+    local BuildFromPath = Shared.BuildFromPath
+    type StorePath = Shared.StorePath
+local TableUtil = require(script.Parent.Parent:WaitForChild("TableUtil"))
+    local Merge1D = TableUtil.Array.Merge1D
+
+local ReplicatedStore = require(script.Parent:WaitForChild("ReplicatedStore"))
+local GeneralStore = require(script.Parent:WaitForChild("GeneralStore"))
+
+local VALIDATE_PARAMS = true
 local TYPE_TABLE = "table"
-local TYPE_NUMBER = "number"
 
-local ERR_NOT_ARRAY = "Item was not an array"
-local ERR_INCREMENT_NOT_NUMBER = "Invalid argument #1 (expected number, got %s)"
-local ERR_INCREMENT_NO_EXISTING_VALUE = "Invalid existing value for %s (expected number, got %s)"
-
-local BuildFromPath = Store._BuildFromPath
-local REMOVE_NODE = Store._REMOVE_NODE
-
-export type Type<T> = {
-    Get: ((Type<T>) -> (T?));
-    Set: ((Type<T>, T) -> ());
-    Await: ((Type<T>) -> (T));
-    Merge: ((Type<T>, T) -> ());
-
-    XGet: ((Type<T>, StorePath) -> (T?));
-    XSet: ((Type<T>, StorePath, T) -> ());
-    XAwait: ((Type<T>, StorePath) -> (T));
-    XMerge: ((Type<T>, StorePath, T) -> ());
-
-    IsMap: ((Type<T>) -> (boolean));
-    IsLeaf: ((Type<T>) -> (boolean));
-    IsArray: ((Type<T>) -> (boolean));
-    IsEmpty: ((Type<T>) -> (boolean));
-    IsContainer: ((Type<T>) -> (boolean));
-
-    -- Number manipulation functions
-    Increment: ((Type<T>, number?, number?) -> (number));
-
-    -- Array manipulation functions
-    Remove: ((Type<T>, number) -> (T));
-    Insert: ((Type<T>, T, number?) -> (number));
-
-    GetValueChangedSignal: ((Type<T>) -> (Signal<T>));
-
-    Extend: ((Type<T>, StorePath) -> (Type<any>));
-}
+local ValidStorePath = Shared.ValidStorePath
+local GetPathString = Shared.GetPathString
 
 local StoreInterface = {}
 StoreInterface.__index = StoreInterface
 
-function StoreInterface.new(StoreObject: Store.RawStore, Path: StorePath)
-    assert(StoreObject, "No StoreContainer object given!")
+local ConstructorParams = TypeGuard.Params(TypeGuard.Object():OfClass(ReplicatedStore):Or(TypeGuard.Object():OfClass(GeneralStore)):FailMessage("Arg #1 supplied must be a ReplicatedStore or a GeneralStore"), ValidStorePath:Optional())
+--- Creates a new StoreInterface object.
+function StoreInterface.new(StoreObject: any, Path: StorePath?): typeof(StoreInterface)
+    if (VALIDATE_PARAMS) then
+        ConstructorParams(StoreObject, Path)
+    end
+
+    Path = Path or {}
 
     local self = {
         _StoreObject = StoreObject;
-        _Path = Path or {};
+        _PathString = GetPathString(Path);
+        _Path = Path;
     };
 
     return setmetatable(self, StoreInterface)
 end
 
---[[
-    Standard get/set/await/etc. for manipulating
-    and reading data.
-]]
-function StoreInterface:Get(...)
-    return self._StoreObject:Get(self._Path, ...)
-end; StoreInterface.get = StoreInterface.Get
+--- Gets a value in the real store.
+function StoreInterface:Get(DefaultValue: any?): any?
+    return self._StoreObject:GetUsingPathString(self._PathString, DefaultValue)
+end
+StoreInterface.get = StoreInterface.Get
 
+--- Sets a value in the real store.
 function StoreInterface:Set(...)
-    self._StoreObject:Set(self._Path, ...)
-end; StoreInterface.set = StoreInterface.Set
+    self._StoreObject:SetUsingPathArray(self._Path, ...)
+end
+StoreInterface.set = StoreInterface.Set
 
-function StoreInterface:Await(...)
-    return self._StoreObject:Await(self._Path, ...)
-end; StoreInterface.await = StoreInterface.Await
+--- Waits for a value in the real store to exist.
+function StoreInterface:Await(Timeout: number?, BypassError: boolean?): any?
+    return self._StoreObject:AwaitUsingPathString(self._PathString, Timeout, BypassError)
+end
+StoreInterface.await = StoreInterface.Await
 
-function StoreInterface:Merge(Value)
+--- Merges a table into the real store. Does NOT start at the path, starts at the root.
+function StoreInterface:Merge(Value: any?)
     -- TODO: progressively build up path container internally too maybe?
     if (next(self._Path) == nil) then
         self._StoreObject:Merge(Value)
     else
-        self._StoreObject:Merge(BuildFromPath(self._Path, Value == nil and REMOVE_NODE or Value))
+        self._StoreObject:Merge(BuildFromPath(self._Path, Value == nil and RemoveNode or Value))
     end
-end; StoreInterface.merge = StoreInterface.Merge
 
---[[
-    X variants i.e. "extend then [do standard action]"
-]]
-function StoreInterface:XGet(Path, ...)
-    return self:Extend(Path):Get(...)
-end; StoreInterface.xGet = StoreInterface.XGet
+    --[[ self._StoreObject:Merge(BuildFromPath(self._Path, Value == nil and RemoveNode or Value)) ]]
+end
+StoreInterface.merge = StoreInterface.Merge
 
+--- Extends this StoreInterface's path by a new path and gets the value corresponding to that path.
+function StoreInterface:XGet(Path): any?
+    return self:Extend(Path):Get()
+end
+StoreInterface.xGet = StoreInterface.XGet
+
+--- Extends this StoreInterface's path by a new path and sets the value corresponding to that path.
 function StoreInterface:XSet(Path, ...)
     self:Extend(Path):Set(...)
-end; StoreInterface.xSet = StoreInterface.XSet
+end
+StoreInterface.xSet = StoreInterface.XSet
 
-function StoreInterface:XAwait(Path, ...)
-    return self:Extend(Path):Await(...)
-end; StoreInterface.xAwait = StoreInterface.XAwait
+--- Extends this StoreInterface's path by a new path and waits for the value corresponding to that path to exist.
+function StoreInterface:XAwait(Path, Timeout: number?, BypassError: boolean?): any?
+    return self:Extend(Path):Await(Timeout, BypassError)
+end
+StoreInterface.xAwait = StoreInterface.XAwait
 
+--- Extends this StoreInterface's path by a new path and merges a table into the value corresponding on that path.
 function StoreInterface:XMerge(Path, ...)
     self:Extend(Path):Merge(...)
-end; StoreInterface.xMerge = StoreInterface.XMerge
+end
+StoreInterface.xMerge = StoreInterface.XMerge
 
--- Numeric value functions
-    function StoreInterface:Increment(ByAmount, DefaultValue, ...)
-        assert(type(ByAmount) == TYPE_NUMBER or ByAmount == nil, ERR_INCREMENT_NOT_NUMBER:format(type(ByAmount)))
+--- Increments a numerical value in the real store, with an optional default value if it doesn't exist.
+--- Note: temporarily deoptimizes replicated store merge batching.
+function StoreInterface:Increment(ByAmount: number, DefaultValue: number?, ...): number
+    return self._StoreObject:IncrementUsingPathArray(self._Path, ByAmount, DefaultValue, ...)
+end
+StoreInterface.increment = StoreInterface.Increment
 
-        local ExistingValue = self:Get()
+--- Removes a value from an array in the real store.
+function StoreInterface:ArrayRemove(...): (any?, number)
+    return self._StoreObject:ArrayRemoveUsingPathString(self._PathString, ...)
+end
+StoreInterface.arrayRemove = StoreInterface.ArrayRemove
 
-        if (DefaultValue and ExistingValue == nil) then
-            ExistingValue = DefaultValue
-            self:Set(DefaultValue)
-        else
-            assert(type(ExistingValue) == TYPE_NUMBER, ERR_INCREMENT_NO_EXISTING_VALUE:format(tostring(self), type(ExistingValue)))
-        end
+--- Inserts a value into an array in the real store.
+function StoreInterface:ArrayInsert(...): number?
+    return self._StoreObject:ArrayInsertUsingPathString(self._PathString, ...)
+end
+StoreInterface.arrayInsert = StoreInterface.ArrayInsert
 
-        local NewValue = ExistingValue + (ByAmount or 1)
-        self:Set(NewValue, ...)
-        return NewValue
-    end; StoreInterface.increment = StoreInterface.Increment
-
--- Array functions
-    function StoreInterface:Remove(Index)
-        assert(self:IsArray() or self:IsEmpty(), ERR_NOT_ARRAY)
-
-        local Array = self:Get()
-        local Size = #Array
-        Index = Index or Size
-        local Temp = Array[Index]
-
-        if (Size > 0) then
-            table.remove(Array, Index)
-            self:Set(Array)
-        end
-
-        return Temp, Index
-    end
-
-    function StoreInterface:Insert(...)
-        assert(self:IsArray() or self:IsEmpty(), ERR_NOT_ARRAY)
-
-        local Array = self:Get()
-        table.insert(Array, ...)
-        self:Set(Array)
-    end
-
-function StoreInterface:IsContainer()
+-- TODO: port these to GeneralStore
+--[[ function StoreInterface:IsContainer()
     return (type(self:Get()) == TYPE_TABLE)
 end; StoreInterface.isContainer = StoreInterface.IsContainer
 
@@ -166,27 +133,25 @@ end; StoreInterface.isMap = StoreInterface.IsMap
 
 function StoreInterface:IsLeaf()
     return (self:Get() ~= nil and not self:IsContainer())
-end StoreInterface.isLeaf = StoreInterface.IsLeaf
+end StoreInterface.isLeaf = StoreInterface.IsLeaf ]]
 
-function StoreInterface:GetValueChangedSignal()
-    return self._StoreObject:GetValueChangedSignal(self._Path)
-end; StoreInterface.getValueChangedSignal = StoreInterface.GetValueChangedSignal
+--- Gets a value changed signal from the real store.
+function StoreInterface:GetValueChangedSignal(): typeof(XSignal)
+    return self._StoreObject:GetValueChangedSignalUsingPathArray(self._Path)
+end
+StoreInterface.getValueChangedSignal = StoreInterface.GetValueChangedSignal
 
---[[
-    Creates a new StoreInterface with an
-    extension of the path.
-]]
-function StoreInterface:Extend(Extra)
-    if (type(Extra) ~= TYPE_TABLE) then
-        Extra = {Extra}
-    end
+--- Creates a new StoreInterface with an extension of the path.
+function StoreInterface:Extend(Extra: any): typeof(StoreInterface)
+    return StoreInterface.new(self._StoreObject, Merge1D(self._Path, (type(Extra) == TYPE_TABLE and Extra or {Extra})))
+end
+StoreInterface.extend = StoreInterface.Extend
 
-    return StoreInterface.new(self._StoreObject, Merge1D(self._Path, Extra))
-end; StoreInterface.extend = StoreInterface.Extend
-
+--- Sets debug logging on/off for the whole store.
 function StoreInterface:SetDebugLog(DebugLog: boolean)
     self._StoreObject:SetDebugLog(DebugLog)
-end; StoreInterface.setDebugLog = StoreInterface.SetDebugLog
+end
+StoreInterface.setDebugLog = StoreInterface.SetDebugLog
 
 function StoreInterface:Destroy()
 end

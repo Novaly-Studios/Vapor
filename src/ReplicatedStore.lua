@@ -1,49 +1,52 @@
---!nonstrict
 local Players = game:GetService("Players")
 
-local ProfileFunction = require(script.Parent:WaitForChild("ProfileFunction"))
 local GeneralStore = require(script.Parent:WaitForChild("GeneralStore"))
+local TypeGuard = require(script.Parent.Parent:WaitForChild("TypeGuard"))
 local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
-local Signal = require(script.Parent.Parent:WaitForChild("Signal"))
+local XSignal = require(script.Parent.Parent:WaitForChild("XSignal"))
+local Shared = require(script.Parent:WaitForChild("Shared"))
 
-local REMOVE_NODE = GeneralStore._REMOVE_NODE
-local BuildFromPath = GeneralStore._BuildFromPath
+local BuildFromPath = Shared.BuildFromPath
+local InternalMerge = Shared.InternalMerge
+local RemoveNode = Shared.RemoveNode
+
+type StorePath = Shared.StorePath
 
 local EMPTY_PATH = {}
 
--- Microprofiler tags
 local REPLICATE_PROCESS_TAG = "ReplicatedStore.Incoming"
-
--- More strings
-local DEFAULT_MERGE_CATEGORY = "*"
-
--- Types
+local DEFAULT_SEND_TO_CATEGORY = "*"
+local EMPTY_STRING = ""
 local TYPE_TABLE = "table"
-local TYPE_INSTANCE = "Instance"
-type RawStore = GeneralStore.RawStore
-type StorePath = GeneralStore.StorePath
 
--- Logs, warnings & errors
-local ERR_ROOT_OVERWRITE = "Attempt to set root table (path empty)"
-local ERR_NO_PATH_GIVEN = "No path given!"
+local METHOD_SHORTENINGS = { -- Sent over network, so gotta save space!
+    ArrayInsertUsingPathArray = "1";
+    ArrayRemoveUsingPathArray = "2";
+    IncrementUsingPathArray = "3";
+    Merge = "4";
+
+    ArrayInsertUsingPathString = "5";
+    ArrayRemoveUsingPathString = "6";
+}
 
 -- Settings
 local MERGE_LIST_DEFAULT_SIZE = Players.MaxPlayers
 local DEBUG_WARN_PATH_CONVERT = true
-local PROFILE_FUNCTIONS = false
+local VALIDATE_PARAMS = true
 
 -----------------------------------------------------------------------------------
 
-local InternalMerge = GeneralStore._InternalMerge
-
--- TODO: test performance of mutable versions
-local function SerializeIncomingData(Data: RawStore): RawStore
+--- Deep copies a table such that:
+--- - All string keys are converted to numbers if they can be converted.
+--- - All sub-tables marked 'RemoveNode' are substituted with a reference to the real RemoveNode, used in the merging process to remove values at paths.
+--- @todo: test performance of mutable versions.
+local function SerializeIncomingData(Data: any): any
     local Result = {}
 
-    for Key, Value in pairs(Data) do
+    for Key, Value in Data do
         if (type(Value) == TYPE_TABLE) then
-            if (Value.REMOVE_NODE) then
-                Value = REMOVE_NODE
+            if (Value._REMOVE_NODE) then
+                Value = RemoveNode
             else
                 Value = SerializeIncomingData(Value)
             end
@@ -55,10 +58,12 @@ local function SerializeIncomingData(Data: RawStore): RawStore
     return Result
 end
 
-local function ConvertToStringIndices(Data: RawStore): RawStore
+--- Deep copies a table such that:
+--- - All numerical keys are converted to strings if they can be.
+local function ConvertToStringIndices(Data: any): any
     local Result = {}
 
-    for Key, Value in pairs(Data) do
+    for Key, Value in Data do
         if (type(Value) == TYPE_TABLE) then
             Value = ConvertToStringIndices(Value)
         end
@@ -69,18 +74,14 @@ local function ConvertToStringIndices(Data: RawStore): RawStore
     return Result
 end
 
-local ConvertPathToNumericRegistry = setmetatable({}, {__mode = "k"})
-
--- Converts an array's elements to all numerics
--- TODO: maybe mutate path (faster) and convert, mark as done so we don't re-process lots
--- TODO: just warn in merge procedure?
+local ConvertPathToNumericCache = setmetatable({}, {__mode = "k"})
+--- Mutably converts a path array's values to numeric where possible.
 local function ConvertPathToNumeric(Path: StorePath)
-    if (ConvertPathToNumericRegistry[Path]) then
+    if (ConvertPathToNumericCache[Path]) then
         return
     end
 
-    for Index = 1, #Path do
-        local Value = Path[Index]
+    for Index, Value in Path do
         local AsNumber = tonumber(Value)
         Path[Index] = AsNumber or Value
 
@@ -89,40 +90,36 @@ local function ConvertPathToNumeric(Path: StorePath)
         end
     end
 
-    ConvertPathToNumericRegistry[Path] = true
-end
-
-if (PROFILE_FUNCTIONS) then
-    SerializeIncomingData = ProfileFunction(SerializeIncomingData, "SerializeIncomingData")
-    ConvertToStringIndices = ProfileFunction(ConvertToStringIndices, "ConvertToStringIndices")
-    ConvertPathToNumeric = ProfileFunction(ConvertPathToNumeric, "ConvertPathToNumeric")
+    ConvertPathToNumericCache[Path] = true
 end
 
 -----------------------------------------------------------------------------------
 
+--- An extension of GeneralStore, allowing for optimized & batched replication of arbitrary data to particular clients.
 local ReplicatedStore = {}
 ReplicatedStore.__index = ReplicatedStore
 ReplicatedStore.Type = "ReplicatedStore"
 
-function ReplicatedStore.new(RemoteEvent, IsServer: boolean)
-    assert(RemoteEvent, "No remote event given!")
-    assert(IsServer ~= nil, "Please indicate whether this is running on server or client!")
+local ConstructorParams = TypeGuard.Params(TypeGuard.Instance("RemoteEvent"):Or(TypeGuard.Object()), TypeGuard.Boolean())
+--- Creates a new ReplicatedStore object.
+function ReplicatedStore.new(RemoteEvent: any, IsServer: boolean): typeof(ReplicatedStore)
+    if (VALIDATE_PARAMS) then
+        ConstructorParams(RemoteEvent, IsServer)
+    end
 
     local self = {
         _Store = GeneralStore.new();
 
-        _DeferredMerge = {};
         _SyncedPlayers = {};
         _BlockedPlayers = {};
+        _DeferredInstructions = {};
 
-        DeferFunction = function(Callback: () -> ())
+        --[[ DeferFunction = function(Callback: () -> ())
             -- Immediate defer by default, but easy to
             -- switch to task.defer or some task.delay
             -- fixed duration function
             Callback()
-        end;
-
-        _Cleaner = Cleaner.new();
+        end; ]]
 
         _Synced = false;
         _IsServer = IsServer;
@@ -132,7 +129,7 @@ function ReplicatedStore.new(RemoteEvent, IsServer: boolean)
 
         _RemoteEvent = RemoteEvent;
 
-        OnDefer = Signal.new();
+        OnDefer = XSignal.new();
     };
 
     return setmetatable(self, ReplicatedStore)
@@ -145,7 +142,7 @@ function ReplicatedStore:InitClient()
     local RemoteEvent = self._RemoteEvent
     local StoreObject = self._Store
 
-    self._EventConnection = RemoteEvent.OnClientEvent:Connect(function(Data: RawStore?, InitialSync: boolean)
+    self._EventConnection = RemoteEvent.OnClientEvent:Connect(function(Data: any?, InitialSync: boolean)
         debug.profilebegin(REPLICATE_PROCESS_TAG)
 
             if (Data == nil) then
@@ -167,8 +164,9 @@ function ReplicatedStore:InitClient()
                 self._Synced = true
             end
 
-            -- Received events are in-order
-            StoreObject:Merge(Data)
+            for _, Call in Data do
+                self[Call.Method](self, unpack(Call.Args))
+            end
         debug.profileend()
     end)
 
@@ -176,7 +174,7 @@ function ReplicatedStore:InitClient()
     self._Initialized = true
 end
 
--- Server method; receives client requests
+--- Server method - receives client requests.
 function ReplicatedStore:InitServer()
     assert(not self._Initialized, "Already initialized on server!")
 
@@ -195,173 +193,134 @@ function ReplicatedStore:Destroy()
     self._Store:Destroy()
 end
 
--- Obtains down a path; does not error
-function ReplicatedStore:Get(Path: StorePath, DefaultValue: any?): any?
+--- See `GeneralStore.GetUsingPathArray`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:GetUsingPathArray(Path: StorePath?, DefaultValue: any?): any?
     Path = Path or EMPTY_PATH
     ConvertPathToNumeric(Path)
-    return self._Store:Get(Path, DefaultValue)
-end
 
--- Immediately update the internal Store object, but
--- create a defer point during which to merge changes
--- to the specific player(s) specified (or all by default)
-function ReplicatedStore:_ServerMerge(Data: RawStore, SendTo: {Player | string}?)
-    if (SendTo) then
-        -- Send only to specific players
-        for _, Player in pairs(SendTo) do
-            self:DeferMerge(Player.Name, Data)
-        end
-    else
-        self:DeferMerge(DEFAULT_MERGE_CATEGORY, Data)
-    end
+    return self._Store:GetUsingPathArray(Path, DefaultValue)
 end
+ReplicatedStore.getUsingPathArray = ReplicatedStore.GetUsingPathArray
 
-function ReplicatedStore:Merge(Data: RawStore, ...)
+--- See `GeneralStore.GetUsingPathString`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:GetUsingPathString(...): any?
+    return self._Store:GetUsingPathString(...)
+end
+ReplicatedStore.getUsingPathString = ReplicatedStore.GetUsingPathString
+
+--- See `GeneralStore.ArrayInsertUsingPathArray`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:ArrayInsertUsingPathArray(Path: StorePath?, Value: any, At: number?, SendTo: {Player}?): number
+    Path = Path or EMPTY_PATH
+    ConvertPathToNumeric(Path)
+
+    -- Keep our core store up to date
+    local Result = self._Store:ArrayInsertUsingPathArray(Path, Value, At)
+    self:_QueueMethod(METHOD_SHORTENINGS.ArrayInsertUsingPathArray, SendTo, Path, Value, At)
+    return Result
+end
+ReplicatedStore.arrayInsertUsingPathArray = ReplicatedStore.ArrayInsertUsingPathArray
+
+--- See `GeneralStore.ArrayInsertUsingPathString`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:ArrayInsertUsingPathString(PathString: string, Value: any, At: number?, SendTo: {Player}?): number
+    local Result = self._Store:ArrayInsertUsingPathString(PathString, Value, At)
+    self:_QueueMethod(METHOD_SHORTENINGS.ArrayInsertUsingPathString, SendTo, PathString, Value, At)
+    return Result
+end
+ReplicatedStore.arrayInsertUsingPathString = ReplicatedStore.ArrayInsertUsingPathString
+
+--- See `GeneralStore.ArrayRemoveUsingPathArray`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:ArrayRemoveUsingPathArray(Path: StorePath, At: number?, SendTo: {Player}?): (any?, number)
+    Path = Path or EMPTY_PATH
+    ConvertPathToNumeric(Path)
+
+    local RemovedValue, RemovedIndex = self._Store:ArrayRemoveUsingPathArray(Path, At)
+    self:_QueueMethod(METHOD_SHORTENINGS.ArrayRemoveUsingPathArray, SendTo, Path, At)
+    return RemovedValue, RemovedIndex
+end
+ReplicatedStore.arrayRemoveUsingPathArray = ReplicatedStore.ArrayRemoveUsingPathArray
+
+--- See `GeneralStore.ArrayRemoveUsingPathString`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:ArrayRemoveUsingPathString(PathString: string, Value: any, At: number?, SendTo: {Player}?): number
+    local RemovedValue, RemovedIndex = self._Store:ArrayRemoveUsingPathString(PathString, Value, At)
+    self:_QueueMethod(METHOD_SHORTENINGS.ArrayRemoveUsingPathString, SendTo, PathString, Value, At)
+    return RemovedValue, RemovedIndex
+end
+ReplicatedStore.arrayRemoveUsingPathString = ReplicatedStore.ArrayRemoveUsingPathString
+
+--- See `GeneralStore.Merge`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:Merge(Data: any, SendTo: {Player}?)
     -- Keep our core store up to date
     self._Store:Merge(Data)
-
-    -- Shaft off sending changes to clients to next defer function cycle (if server)
-    if (self._IsServer) then
-        self:_ServerMerge(Data, ...)
-    end
+    self:_QueueMethod(METHOD_SHORTENINGS.Merge, SendTo, Data)
 end
+ReplicatedStore.merge = ReplicatedStore.Merge
 
-function ReplicatedStore:Set(Path: StorePath, Value: any?, SendTo: {Player | string}?)
-    assert(Path, ERR_NO_PATH_GIVEN)
-    assert(#Path > 0, ERR_ROOT_OVERWRITE)
+--- See `GeneralStore.IncrementUsingPathArray`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:IncrementUsingPathArray(Path: StorePath, By: number?, Default: number?, SendTo: {Player}?): number
+    ConvertPathToNumeric(Path)
 
+    local NewValue = self._Store:IncrementUsingPathArray(Path, By, Default)
+    self:_QueueMethod(METHOD_SHORTENINGS.IncrementUsingPathArray, SendTo, Path, By, Default)
+    return NewValue
+end
+ReplicatedStore.incrementUsingPathArray = ReplicatedStore.IncrementUsingPathArray
+
+--- See `GeneralStore.SetUsingPathArray`. Has an optional SendTo array which can contain a list of players (or no players) to selectively
+--- replicate this to.
+function ReplicatedStore:SetUsingPathArray(Path: StorePath, Value: any?, SendTo: {Player}?)
     Path = Path or EMPTY_PATH
     ConvertPathToNumeric(Path)
 
-    if (type(Value) == TYPE_TABLE and self:Get(Path)) then
+    if (type(Value) == TYPE_TABLE and self:GetUsingPathArray(Path)) then
         -- Set using table -> remove previous value and overwrite (we don't want to merge 'set' tables in - unintuitive)
-        self:Merge(BuildFromPath(Path, REMOVE_NODE), SendTo)
+        self:Merge(BuildFromPath(Path, RemoveNode), SendTo)
     end
 
-    self:Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value), SendTo)
+    self:Merge(BuildFromPath(Path, Value == nil and RemoveNode or Value), SendTo)
 end
+ReplicatedStore.setUsingPathArray = ReplicatedStore.SetUsingPathArray
 
-function ReplicatedStore:DeferMerge(Category: string, Data: RawStore)
-    -- Insert into merge list for this category
-    local DeferredMerge = self._DeferredMerge
-    local MergeList = DeferredMerge[Category]
-
-    if (not MergeList) then
-        MergeList = table.create(MERGE_LIST_DEFAULT_SIZE)
-        DeferredMerge[Category] = MergeList
-    end
-
-    table.insert(MergeList, Data)
-
-    -- Activate next defer function
-    if (not self._Deferring) then
-        self._Deferring = true
-
-        self.DeferFunction(function()
-            -- Since this may yield for a later frame, check if ReplicatedStore was Destroyed & reject defer if so
-            if (table.isfrozen(self)) then
-                return
-            end
-
-            self._Deferring = false
-            self:DeferProcess()
-        end)
-    end
-end
-
-function ReplicatedStore:DeferProcess()
-    local BlockedPlayers = self._BlockedPlayers
-    local DeferredMerge = self._DeferredMerge
-    local RemoteEvent = self._RemoteEvent
-
-    for PlayerName, Merges in pairs(DeferredMerge) do
-        local Merged = {}
-
-        for Index = 1, #Merges do
-            InternalMerge(Merges[Index], Merged, true)
-        end
-
-        Merged = ConvertToStringIndices(Merged)
-
-        if (PlayerName == DEFAULT_MERGE_CATEGORY) then
-            -- Default merge category -> all players except ones in the block list
-
-            if (next(BlockedPlayers) == nil) then
-                -- No blocked players -> FireAllClients broadcast (more efficient)
-                RemoteEvent:FireAllClients(Merged, false)
-            else
-                for _, Player in ipairs(Players:GetChildren()) do
-                    if (BlockedPlayers[Player.Name]) then
-                        continue
-                    end
-
-                    RemoteEvent:FireClient(Player, Merged, false)
-                end
-            end
-
-            continue
-        end
-
-        -- Player-specific merge category -> a specific player
-        local GotPlayer = Players:FindFirstChild(PlayerName)
-
-        if (not GotPlayer or BlockedPlayers[PlayerName]) then
-            continue
-        end
-
-        RemoteEvent:FireClient(GotPlayer, Merged, false)
-    end
-
-    self._DeferredMerge = {}
-    self.OnDefer:Fire()
-end
-
-function ReplicatedStore:GetValueChangedSignal(Path: StorePath): RBXScriptSignal
+--- See `GeneralStore.GetValueChangedSignalUsingPathArray`.
+function ReplicatedStore:GetValueChangedSignalUsingPathArray(Path: StorePath): typeof(XSignal)
     Path = Path or EMPTY_PATH
     ConvertPathToNumeric(Path)
-    return self._Store:GetValueChangedSignal(Path)
-end
 
-function ReplicatedStore:Await(Path: StorePath, Timeout: number): any?
+    return self._Store:GetValueChangedSignalUsingPathArray(Path)
+end
+ReplicatedStore.GetValueChangedSignalUsingPathArray = ReplicatedStore.GetValueChangedSignalUsingPathArray
+
+--- See `GeneralStore.AwaitUsingPathArray`.
+function ReplicatedStore:AwaitUsingPathArray(Path: StorePath, ...): any?
     Path = Path or EMPTY_PATH
     ConvertPathToNumeric(Path)
-    return self._Store:Await(Path, Timeout)
-end
-ReplicatedStore.await = ReplicatedStore.Await
 
+    return self._Store:AwaitUsingPathArray(Path, ...)
+end
+ReplicatedStore.awaitUsingPathArray = ReplicatedStore.AwaitUsingPathArray
+
+--- See `GeneralStore.AwaitUsingPathString`.
+function ReplicatedStore:AwaitUsingPathString(...): any?
+    return self._Store:AwaitUsingPathString(...)
+end
+ReplicatedStore.awaitUsingPathString = ReplicatedStore.AwaitUsingPathString
+
+--- See `GeneralStore.SetDebugLog`.
 function ReplicatedStore:SetDebugLog(DebugLog: boolean)
     self._Store:SetDebugLog(DebugLog)
 end
-
 ReplicatedStore.setDebugLog = ReplicatedStore.SetDebugLog
 
-function ReplicatedStore:_FullSync(Player: Player, InitialSync: boolean)
-    if (self._TestMode) then
-        self._RemoteEvent:FireClient(Player, ConvertToStringIndices(self:Get()), InitialSync)
-        return
-    end
-
-    local SyncedPlayers = self._SyncedPlayers
-    local UserID = Player.UserId
-
-    if (SyncedPlayers[UserID]) then
-        print("[ReplicatedStore] Reject sync request from " .. Player.Name)
-        return
-    end
-
-    SyncedPlayers[UserID] = true
-
-    self._Cleaner:Add(Player.AncestryChanged:Connect(function(_, NewParent)
-        if (NewParent ~= nil) then
-            return
-        end
-
-        SyncedPlayers[UserID] = nil
-    end))
-
-    self._RemoteEvent:FireClient(Player, ConvertToStringIndices(self:Get()), InitialSync)
-end
-
+--- Untested - do not use.
+--- Note: likely will require erasure of player's merge / call batches too.
+--- Blocks a player from receiving updates from this store and optionally nullifies the store on their client.
 function ReplicatedStore:Block(Player: Player, Clear: boolean?)
     error("Unimplemented")
 
@@ -382,7 +341,10 @@ function ReplicatedStore:Block(Player: Player, Clear: boolean?)
         self._RemoteEvent:FireClient(Player)
     end
 end
+ReplicatedStore.block = ReplicatedStore.Block
 
+--- Untested - do not use. This will likely be used for an upcoming world streaming system.
+--- Unblocks a player from receiving updates from this store and optionally re-sends the store.
 function ReplicatedStore:Unblock(Player: Player, Renew: boolean?)
     error("Unimplemented")
 
@@ -402,13 +364,172 @@ function ReplicatedStore:Unblock(Player: Player, Renew: boolean?)
         self:_FullSync(Player, false)
     end
 end
+ReplicatedStore.unblock = ReplicatedStore.Unblock
 
-if (PROFILE_FUNCTIONS) then
-    for Key, Value in pairs(ReplicatedStore) do
-        if (type(Value) == "function") then
-            ReplicatedStore[Key] = ProfileFunction(Value, ReplicatedStore.Type .. Key)
+--- Shaft off sending changes to clients to next defer function cycle (if server). See _PrepareDefer and _DeferProcess
+--- for the subsequent data preparation steps.
+function ReplicatedStore:_QueueMethod(Name: string, SendTo: {Player}?, ...)
+    if (self._IsServer) then
+        if (SendTo) then
+            for _, Player in SendTo do
+                self:_PrepareDefer(Player.Name, Name, ...)
+            end
+        else
+            self:_PrepareDefer(DEFAULT_SEND_TO_CATEGORY, Name, ...)
         end
     end
+end
+
+local ShortenedMergeName = METHOD_SHORTENINGS.Merge
+--- Enqueues fundamental mutation method calls (Merge, ArrayInsert, ArrayRemove, Increment, etc.) to be sent to clients,
+--- attempts to optimize them, and initiates a defer point after which the batch will be sent.
+--- @todo Condense down consecutive non-merge-optimizable method args into {Method = "Test", Args = { {1}, {2, 3}, {4} }}
+function ReplicatedStore:_PrepareDefer(SendToCategory: string, Method: string, ...)
+    debug.profilebegin("PrepareDefer(" .. Method .. ")")
+
+    -- Find or setup _instruction list for that player
+    local DeferredInstructions = self._DeferredInstructions
+    local InstructionList = DeferredInstructions[SendToCategory]
+
+    if (not InstructionList) then
+        InstructionList = table.create(MERGE_LIST_DEFAULT_SIZE)
+        DeferredInstructions[SendToCategory] = InstructionList
+    end
+
+    -- Record the call
+    if (Method == ShortenedMergeName) then
+        -- Condense down consecutive merge calls into a single merge call to send to the client
+        -- Otherwise begin by just creating a new merge on the list
+        -- Note: any theoretical GeneralStore mutation operation that can be *fully* implemented with Merge / Set calls should do so as this is optimised by the following mechanism
+        local MergeIn = select(1, ...)
+        local LastCall = InstructionList[#InstructionList]
+        local LastMerge
+
+        if (LastCall and LastCall.Method == ShortenedMergeName) then
+            LastMerge = LastCall.Args[1]
+        end
+
+        if (LastMerge) then
+            InternalMerge(MergeIn, LastMerge, true)
+        else
+            table.insert(InstructionList, {
+                Method = Method;
+                Args = {MergeIn};
+            })
+        end
+    else
+        -- Non-merge calls deoptimize the above, but it has to happen to avoid desync
+        table.insert(InstructionList, {
+            Method = Method;
+            Args = {...};
+        })
+    end
+
+    -- Activate next defer function
+    if (not self._Deferring) then
+        self._Deferring = true
+
+        local DeferFunction = self.DeferFunction
+
+        if (DeferFunction) then
+            DeferFunction(function()
+                -- Since this may yield for a later frame, check if ReplicatedStore was Destroyed & reject defer if so
+                if (table.isfrozen(self)) then
+                    return
+                end
+
+                self._Deferring = false
+                self:_DeferProcess()
+            end)
+        else
+            self._Deferring = false
+            self:_DeferProcess()
+        end
+    end
+
+    debug.profileend()
+end
+
+--- Extension of _PrepareDefer. Initiates a defer point for sending data to the client, during which
+--- specific calls will be optimised into a compressed structure.
+function ReplicatedStore:_DeferProcess()
+    local DeferredInstructions = self._DeferredInstructions
+    local BlockedPlayers = self._BlockedPlayers
+    local RemoteEvent = self._RemoteEvent
+
+    for PlayerName, Data in DeferredInstructions do
+        -- Default category -> send this data to all players except ones in the block list
+        if (PlayerName == DEFAULT_SEND_TO_CATEGORY) then
+            if (next(BlockedPlayers) == nil) then
+                -- No blocked players -> FireAllClients broadcast (more efficient)
+                RemoteEvent:FireAllClients(Data, false)
+            else
+                for _, Player in Players:GetChildren() do
+                    if (BlockedPlayers[Player.Name]) then
+                        continue
+                    end
+
+                    RemoteEvent:FireClient(Player, Data, false)
+                end
+            end
+
+            continue
+        end
+
+        -- Player-specific -> send to that player
+        local GotPlayer = Players:FindFirstChild(PlayerName)
+
+        if (not GotPlayer or BlockedPlayers[PlayerName]) then
+            continue
+        end
+
+        RemoteEvent:FireClient(GotPlayer, Data, false)
+    end
+
+    table.clear(self._DeferredInstructions)
+    self.OnDefer:Fire()
+end
+
+--- Fully syncs this store's data down to a specific client who requests it.
+--- Blocks subsequent calls to ensure exploiters cannot overload the server.
+function ReplicatedStore:_FullSync(Player: Player, InitialSync: boolean)
+    if (self._TestMode) then
+        local Package = {{
+            Method = "Merge";
+            Args = {ConvertToStringIndices(self:GetUsingPathString())};
+        }}
+        self._RemoteEvent:FireClient(Player, Package, InitialSync)
+        return
+    end
+
+    local SyncedPlayers = self._SyncedPlayers
+    local UserID = Player.UserId
+
+    if (SyncedPlayers[UserID]) then
+        print("[ReplicatedStore] Reject sync request from " .. Player.Name)
+        return
+    end
+
+    SyncedPlayers[UserID] = true
+
+    local Connection; Connection = Player.AncestryChanged:Connect(function(_, NewParent)
+        if (NewParent ~= nil) then
+            return
+        end
+
+        Connection:Disconnect()
+        SyncedPlayers[UserID] = nil
+    end)
+
+    local Package = {{
+        Method = "Merge";
+        Args = {ConvertToStringIndices(self:GetUsingPathString())};
+    }}
+    self._RemoteEvent:FireClient(Player, Package, InitialSync)
+end
+
+for OriginalName, ShortenedName in METHOD_SHORTENINGS do
+    ReplicatedStore[ShortenedName] = ReplicatedStore[OriginalName]
 end
 
 Cleaner.Wrap(ReplicatedStore)

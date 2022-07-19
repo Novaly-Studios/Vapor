@@ -1,10 +1,12 @@
 local RunService = game:GetService("RunService")
-    local IsClient = RunService:IsClient()
+local IsClient = RunService:IsClient()
 
 local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
+local TypeGuard = require(script.Parent.Parent:WaitForChild("TypeGuard"))
 local StoreInterface = require(script.Parent:WaitForChild("StoreInterface"))
 local ReplicatedStore = require(script.Parent:WaitForChild("ReplicatedStore"))
 
+local VALIDATE_PARAMS = true
 local REMOTE_WAIT_TIMEOUT = 60
 
 local TYPE_INSTANCE = "Instance"
@@ -14,7 +16,7 @@ local CLIENT_PARTITION_TAG = "ClientPartition"
 
 local ERR_ROOT_TYPE = "Instance expected, got %s"
 local ERR_REMOTE_TIME_OUT = "Wait for partition timed out: %s"
-local ERR_ROOT_DEPARENTED = ""
+local ERR_ROOT_DEPARENTED = "Instance was already deparented"
 local ERR_PARTITION_ALREADY_TAKEN = "Partition already taken: %s"
 local ERR_PARTITION_ALREADY_ACTIVE = "Partition already active: %s"
 
@@ -22,9 +24,12 @@ local InstanceReplication = {}
 InstanceReplication.__index = InstanceReplication
 InstanceReplication.ReplicatedStoreCache = {}
 
-local function Client(Root: Instance, PartitionName: string)
-    assert(typeof(Root) == TYPE_INSTANCE, ERR_ROOT_TYPE:format(typeof(Root)))
-    assert(Root.Parent ~= nil, ERR_ROOT_DEPARENTED)
+local ClientParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), TypeGuard.Boolean():Optional())
+
+local function Client(Root: Instance, PartitionName: string, ShouldYieldOnRemove: boolean?)
+    if (VALIDATE_PARAMS) then
+        ClientParams(Root, PartitionName, ShouldYieldOnRemove)
+    end
 
     local Remote = Root:WaitForChild(PartitionName, REMOTE_WAIT_TIMEOUT)
 
@@ -45,9 +50,18 @@ local function Client(Root: Instance, PartitionName: string)
     local Interface = StoreInterface.new(ReplicationObject)
     CleanerObject:Add(Interface)
 
-    CleanerObject:Add(Root.AncestryChanged:Connect(function(_, NewParent)
+    local CurrentLocation = Remote:GetFullName()
+
+    CleanerObject:Add(Remote.AncestryChanged:Connect(function(_, NewParent)
+        if (ShouldYieldOnRemove) then
+            task.wait()
+        end
+
         if (NewParent == nil) then
+            print("[InstanceReplication] Remote deparented: " .. CurrentLocation)
             CleanerObject:Clean()
+        else
+            CurrentLocation = Remote:GetFullName()
         end
     end))
 
@@ -56,7 +70,13 @@ local function Client(Root: Instance, PartitionName: string)
     return Interface, ReplicationObject
 end
 
-local function Server(Root: Instance, PartitionName: string, Interval: number?)
+local ServerParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), TypeGuard.Number():Optional(), TypeGuard.Boolean():Optional())
+
+local function Server(Root: Instance, PartitionName: string, Interval: number?, ShouldYieldOnRemove: boolean?)
+    if (VALIDATE_PARAMS) then
+        ServerParams(Root, PartitionName, Interval, ShouldYieldOnRemove)
+    end
+
     assert(typeof(Root) == TYPE_INSTANCE, ERR_ROOT_TYPE:format(typeof(Root)))
     assert(Root.Parent ~= nil, ERR_ROOT_DEPARENTED)
     assert(Root:FindFirstChild(PartitionName) == nil, ERR_PARTITION_ALREADY_TAKEN:format(PartitionName))
@@ -79,9 +99,18 @@ local function Server(Root: Instance, PartitionName: string, Interval: number?)
     local Interface = StoreInterface.new(ReplicationObject)
     CleanerObject:Add(Interface)
 
-    CleanerObject:Add(Root.AncestryChanged:Connect(function(_, NewParent)
+    local CurrentLocation = Remote:GetFullName()
+
+    CleanerObject:Add(Remote.AncestryChanged:Connect(function(_, NewParent)
         if (NewParent == nil) then
+            if (ShouldYieldOnRemove) then
+                task.wait()
+            end
+
+            print("[InstanceReplication] Remote deparented: " .. CurrentLocation)
             CleanerObject:Clean()
+        else
+            CurrentLocation = Remote:GetFullName()
         end
     end))
 
