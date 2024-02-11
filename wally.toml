@@ -1,13 +1,13 @@
 [package]
 name = "tpc9000/vapor"
-version = "0.1.0"
+version = "0.2.0"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 license = "MIT"
 authors = ["tpc9000"]
 
 [dependencies]
-TypeGuard = "tpc9000/typeguard@2.3.0"
-TableUtil = "tpc9000/tableutil@0.1.1"
-Cleaner = "tpc9000/cleaner@0.1.1"
-XSignal = "tpc9000/xsignal@0.1.0"
+TypeGuard = "tpc9000/typeguard@5.0.0"
+TableUtil = "tpc9000/tableutil@0.6.0"
+Cleaner = "tpc9000/cleaner@0.1.2"
+XSignal = "tpc9000/xsignal@2.0.0"

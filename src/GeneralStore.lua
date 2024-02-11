@@ -1,728 +1,546 @@
-local script = script
+--!nonstrict
 
--- Allows easy command bar paste
+-- Allows easy command bar paste.
 if (not script) then
-    script = game:GetService("ReplicatedFirst").Vapor.GeneralStore
+	script = game:GetService("ReplicatedFirst").Vapor.GeneralStore
 end
 
-local TypeGuard = require(script.Parent.Parent:WaitForChild("TypeGuard"))
 local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
 local XSignal = require(script.Parent.Parent:WaitForChild("XSignal"))
 
-local Shared = require(script.Parent:WaitForChild("Shared"))
-
-type StoreKey = Shared.StoreKey
-type StorePath = Shared.StorePath
-
-local ValidStorePath = Shared.ValidStorePath
-local GetPathString = Shared.GetPathString
-local BuildFromPath = Shared.BuildFromPath
-local PathTraverse = Shared.PathTraverse
-local RemoveNode = Shared.RemoveNode
-
-local WEAK_KEY_MT = {__mode = "k"}
-
-local FLAT_PATH_DELIMITER = Shared.FlatPathDelimiter
-local EMPTY_PATH_ARRAY = {}
+-- More strings
+local FLAT_PATH_DELIMITER = "^"
 local EMPTY_STRING = ""
 
 -- Types
-local TYPE_NUMBER = "number"
+export type StoreKey = string | number
+export type RawStore = {[StoreKey]: any}
+export type StorePath = {StoreKey}
+
+local TYPE_STRING = "string"
 local TYPE_TABLE = "table"
 
 -- Logs, warnings & errors
 local NAME_PREFIX = "[GeneralStore] "
 
-local WARN_INFINITE_WAIT = NAME_PREFIX .. "Potentially infinite wait on '%s'.\n%s"
-local LOG_CHANGE = NAME_PREFIX .. "Change %s = %s"
+local LOG_UP_PROPAGATE = NAME_PREFIX .. "Up-propagate %s"
+local LOG_CHANGE = NAME_PREFIX .. "Change %s (%s -> %s)"
+local LOG_CREATE = NAME_PREFIX .. "Create %s = %s"
+local LOG_DESTROY = NAME_PREFIX .. "Destroy %s"
 
-local ERR_STORE_TIMEOUT_REACHED = NAME_PREFIX .. "Store timeout reached on path: %s (%ds)"
-local ERR_MIXED_VALUES = NAME_PREFIX .. "Attempted to insert using mixed values with value homogeneity enabled"
-local ERR_MIXED_KEYS = NAME_PREFIX .. "Attempted to insert using mixed keys with key homogeneity enabled"
+local WARN_INFINITE_WAIT = NAME_PREFIX .. "Potentially infinite wait on '%s'.\n%s"
+
+local ERR_STORE_TIMEOUT_REACHED = NAME_PREFIX .. "Store timeout reached! Path: %s (%ds)"
+local ERR_AWAIT_PATH_NOT_STRING = NAME_PREFIX .. "AwaitingPath not a string!"
+local ERR_AWAIT_PATH_NOT_GIVEN = NAME_PREFIX .. "AwaitingPath not given!"
+local ERR_MERGE_ATOM_ATTEMPT = NAME_PREFIX .. "Cannot merge an atom into the store!"
+local ERR_NO_EXISTING_AWAIT = NAME_PREFIX .. "No existing await event for: %s"
+local ERR_NO_ITEMS_IN_PATH = NAME_PREFIX .. "No items in path (no ascendants derivable)"
+local ERR_ROOT_OVERWRITE = NAME_PREFIX .. "Attempt to set root table (path empty)"
+local ERR_NO_VALUE_GIVEN = NAME_PREFIX .. "No value given!"
+local ERR_NO_PATH_GIVEN = NAME_PREFIX .. "No path given!"
+local ERR_MIXED_KEYS = NAME_PREFIX .. "Attempted to insert using mixed keys!"
+
+-- Don't change
+local REMOVE_NODE = {REMOVE_NODE = true}
+local EMPTY_PATH = {}
 
 -- Settings
-local VALIDATE_PARAMS = true -- Check the types for various functions? (Worse performance but better debugging if true)
 local DEFAULT_TIMEOUT = 120 -- Await timeout, prevents memory leaks
-local TIMEOUT_WARN = 10 -- When to warn user in possible timeout case
+local TIMEOUT_WARN = 5 -- When to warn user in possible timeout case
 
 -----------------------------------------------------------------------------------
 
--- @todo GeneralStore.Move(PathA, PathB)
--- @todo GeneralStore.Swap(PathA, PathB)
--- @todo GeneralStore.MergeUsingPathArray(PathArray, Value)
--- @todo GeneralStore.ClearUsingPathString(PathString)
+-- Traverses each item in the table recursively, creating a path string for each
+-- Not inclusive of root
+local function PathTraverse(Root: RawStore, Path: string, Callback: (string, any, string, string) -> ())
+    for Key, Value in Root do
+        local NewPath = Path .. tostring(Key) .. FLAT_PATH_DELIMITER
 
---- A store which wraps a normal Lua table, allowing for changed signals,
---- child-parent associations, and more. Note: all mutation of the store
---- MUST be achieved through GeneralStore methods, or it will become
---- desynced.
-local GeneralStore = {}
-GeneralStore.__index = GeneralStore
-GeneralStore.Type = "GeneralStore"
+        if (type(Value) == TYPE_TABLE) then
+            PathTraverse(Value, NewPath, Callback)
+        end
 
-local ConstructorParams = TypeGuard.Params(TypeGuard.Function():Optional(), TypeGuard.Object():Optional())
---- Creates a new GeneralStore object.
-function GeneralStore.new(DeferFunction, DefaultStructure: any?)
-    ConstructorParams(DeferFunction, DefaultStructure)
+        Callback(NewPath, Value, Key, Path)
+    end
+end
 
-    local StoreStructure = {}
-    local FlatRefs = {[EMPTY_STRING] = StoreStructure}
+local function GetPathString(Path: StorePath): string
+    local Length = #Path
+    local Result = EMPTY_STRING
+
+    for Index = 1, Length do
+        Result ..= tostring(Path[Index]) .. FLAT_PATH_DELIMITER
+    end
+
+    return Result
+end
+
+local function InternalMerge(Data, Into, BypassRemoveNode)
+    for Key, Value in Data do
+        if ((not BypassRemoveNode) and Value == REMOVE_NODE) then
+            Into[Key] = nil
+            continue
+        end
+
+        if (typeof(Value) == "table") then
+            local Got = Into[Key]
+
+            if (Got == nil) then
+                Got = {}
+                Into[Key] = Got
+            end
+
+            if (typeof(Got) ~= "table" and Value == REMOVE_NODE) then
+                Into[Key] = REMOVE_NODE
+                continue
+            end
+
+            InternalMerge(Value, Got, BypassRemoveNode)
+            continue
+        end
+
+        Into[Key] = Value
+    end
+end
+
+local function BuildFromPath(Path: StorePath, Value: any): RawStore
+    assert(Path, ERR_NO_PATH_GIVEN)
+    assert(Value ~= nil, ERR_NO_VALUE_GIVEN)
+
+    local Length = #Path
+    assert(Length > 0, ERR_NO_ITEMS_IN_PATH)
+
+    local Built = {}
+    local Last = Built
+
+    for Index = 1, Length - 1 do
+        local Key = Path[Index]
+        local Temp = {}
+        Last[Key] = Temp
+        Last = Temp
+    end
+
+    Last[Path[Length]] = Value
+
+    return Built
+end
+
+-----------------------------------------------------------------------------------
+
+local Store = {}
+Store.__index = Store
+Store.Type = "Store"
+
+function Store.new(DeferFunction, DefaultStructure: any?)
+    local StoreStructure = {}; -- The data to be replicated
 
     local self = {
-        _Store = StoreStructure; -- The main table root
-        _Awaiting = setmetatable({}, WEAK_KEY_MT); -- For association of path strings to XSignals which fire for changes on that respective path
-        _NodeToPath = setmetatable({}, WEAK_KEY_MT); -- For associations of nodes to their path strings
-        _PathToValue = FlatRefs; -- For O(1) access on known paths using their strings
-        _PathToParentPath = {}; -- For associations of child nodes to their parent node
+        _Store = StoreStructure;
 
+        _Awaiting = setmetatable({}, {__mode = "k"}); -- Awaiting: {[PathString]: Signal}
+        _DeferredEvents = {}; -- DeferredEvents: {[string]: Signal}
+
+        _DebugLog = false;
         _Deferring = false;
-        _DeferFunction = DeferFunction;
-        _DeferredEvents = {}; -- Caches the latest data on changed events and fires at a defer point
 
-        _DebugLog = false; -- Log any changes to output
-        _EnforceHomogeneousKeys = true; -- For all keys in a node, they must be the same type
-        _EnforceHomogeneousAtoms = true; -- For all non-table values in a node, they must be the same type
+        DeferFunction = DeferFunction;
     };
 
-    local Object = setmetatable(self, GeneralStore)
+    local Object = setmetatable(self, Store)
 
     if (DefaultStructure) then
-        -- Not possible to hook into changed events using this, since it occurs in construction
+        -- Not possible to hook into changed events using this,
+        -- since it occurs in construction
         Object:Merge(DefaultStructure)
     end
 
     return Object
 end
 
-local SetHomogeneousKeysEnforcedParams = TypeGuard.Params(TypeGuard.Boolean())
---- Enabled homogeneous key checking (two keys in a node cannot differ in type).
-function GeneralStore:SetHomogeneousKeysEnforced(Enabled: boolean)
-    SetHomogeneousKeysEnforcedParams(Enabled)
-    self._EnforceHomogeneousKeys = Enabled
+function Store:Destroy()
+    for _, Event in self._Awaiting do
+        Event:Fire(nil) -- Release all awaiting
+        Event:Destroy()
+    end
 end
 
-local SetHomogeneousValuesEnforcementParams = TypeGuard.Params(TypeGuard.Boolean())
---- Enabled homogeneous value checking (two different value types cannot co-exist in a node, except for tables).
-function GeneralStore:SetHomogeneousValuesEnforcement(Enabled: boolean)
-    SetHomogeneousValuesEnforcementParams(Enabled)
-    self._EnforceHomogeneousValues = Enabled
+--[[
+    Obtains down a path, and does not error for nil values.
+]]
+function Store:Get(Path: StorePath, DefaultValue: any?): any?
+    Path = Path or EMPTY_PATH
+
+    local Result = self._Store
+
+    for Index = 1, #Path do
+        Result = Result[Path[Index]]
+
+        if (Result == nil) then
+            return DefaultValue
+        end
+    end
+
+    return Result
 end
+Store.get = Store.Get
 
---- Clears the whole store, releasing all the awaiting events.
-function GeneralStore:Destroy()
-    self:ClearUsingPathArray(EMPTY_PATH_ARRAY)
+--[[
+    Sets down a path; constructs tables if none are present along the way.
+]]
+function Store:Set(Path: StorePath, Value: any?)
+    assert(Path, ERR_NO_PATH_GIVEN)
+    assert(#Path > 0, ERR_ROOT_OVERWRITE)
+
+    if (type(Value) == TYPE_TABLE and self:Get(Path)) then
+        -- Set using table -> remove previous value and overwrite (we don't want to merge 'set' tables in - unintuitive)
+        self:Merge(BuildFromPath(Path, REMOVE_NODE))
+    end
+
+    self:Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value))
 end
+Store.set = Store.Set
 
-local ClearUsingPathArrayParams = TypeGuard.Params(ValidStorePath)
---- Clears a node from the store at a path.
-function GeneralStore:ClearUsingPathArray(Path: StorePath?)
-    Path = Path or EMPTY_PATH_ARRAY
+--[[
+    Same as Set except merges with existing tables instead
+    of overwriting them.
+]]
+function Store:SetMerge(Path: StorePath, Value: any?)
+    assert(Path, ERR_NO_PATH_GIVEN)
+    assert(#Path > 0, ERR_ROOT_OVERWRITE)
 
-    if (VALIDATE_PARAMS) then
-        ClearUsingPathArrayParams(Path)
-    end
-
-    local ValuePath = GetPathString(Path)
-    local Value = self:GetUsingPathString(ValuePath)
-    assert(typeof(Value) == TYPE_TABLE, "Path was not a node: " .. tostring(ValuePath))
-
-    local FinalMerge = BuildFromPath(Path, {})
-
-    for Key in Value do
-        FinalMerge[Key] = RemoveNode
-    end
-
-    self:Merge(FinalMerge)
+    self:Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value))
 end
-GeneralStore.clearUsingPathArray = GeneralStore.ClearUsingPathArray
+Store.setMerge = Store.SetMerge
 
-local GetUsingPathStringParams = TypeGuard.Params(TypeGuard.String():Optional())
---- Finds a value from the store corresponding to the given path defined by a string.
-function GeneralStore:GetUsingPathString(PathString: string?, DefaultValue: any?): any?
-    PathString = PathString or EMPTY_STRING
+--[[
+    Merges a data structure into the existing structure.
+    The core mechanism for changing the store.
+]]
+function Store:Merge(Data: RawStore)
+    assert(type(Data) == TYPE_TABLE, ERR_MERGE_ATOM_ATTEMPT)
 
-    if (VALIDATE_PARAMS) then
-        GetUsingPathStringParams(PathString)
-    end
-
-    local Found = self._PathToValue[PathString]
-
-    if (Found == nil) then
-        Found = DefaultValue
-    end
-
-    return Found
+    local StoreData = self._Store
+    self:_Merge(EMPTY_STRING, Data, StoreData)
+    self:_PathWasChanged(EMPTY_STRING, StoreData, StoreData, nil, nil)
 end
-GeneralStore.GetUsingPathString = GeneralStore.GetUsingPathString
+Store.merge = Store.Merge
 
-local GetUsingPathArrayParams = TypeGuard.Params(ValidStorePath:Optional())
---- Finds a value from the store corresponding to the given path defined by an array.
-function GeneralStore:GetUsingPathArray(Path: StorePath?, DefaultValue: any?): any?
-    Path = Path or EMPTY_PATH_ARRAY
-
-    if (VALIDATE_PARAMS) then
-        GetUsingPathArrayParams(Path)
+--[[
+    Clears the whole store.
+]]
+function Store:Clear()
+    for Key in self:Get() do
+        self:Merge({[Key] = REMOVE_NODE})
     end
-
-    return self:GetUsingPathString(GetPathString(Path), DefaultValue)
 end
-GeneralStore.getUsingPathArray = GeneralStore.GetUsingPathArray
+Store.clear = Store.Clear
 
-local SetUsingPathArrayParams = TypeGuard.Params(ValidStorePath:Optional())
---- Sets down a path; constructs tables if none are present along the way.
-function GeneralStore:SetUsingPathArray(Path: StorePath, Value: any?, DoMerge: boolean?)
-    Path = Path or EMPTY_PATH_ARRAY
-
-    if (VALIDATE_PARAMS) then
-        SetUsingPathArrayParams(Path)
-    end
-
-    -- Set on root path -> error
-    -- TODO: calling set on the root path and passing a table as the value should clear the store & set the new values
-    local ExistingValue = self:GetUsingPathString(GetPathString(Path))
-    assert(ExistingValue ~= self._Store, "Cannot overwrite root table")
-
-    -- Set using table -> remove previous value and overwrite (we don't want to merge 'set' tables in - unintuitive)
-    if (type(Value) == TYPE_TABLE and ExistingValue and not DoMerge) then
-        self:Merge(BuildFromPath(Path, RemoveNode))
-    end
-
-    self:Merge(BuildFromPath(Path, Value == nil and RemoveNode or Value))
-end
-GeneralStore.setUsingPathArray = GeneralStore.SetUsingPathArray
-
-local AwaitUsingPathArrayParams = TypeGuard.Params(ValidStorePath, TypeGuard.Number():Optional(), TypeGuard.Boolean():Optional())
---- Waits until a value is not nil at the given path defined by an array. The default timeout is 120 seconds.
-function GeneralStore:AwaitUsingPathArray(Path: StorePath?, Timeout: number?, BypassError: boolean?): any?
-    Path = Path or EMPTY_PATH_ARRAY
-
-    if (VALIDATE_PARAMS) then
-        AwaitUsingPathArrayParams(Path, Timeout, BypassError)
-    end
-
-    return self:AwaitUsingPathString(GetPathString(Path), Timeout, BypassError)
-end
-GeneralStore.awaitUsingPathArray = GeneralStore.AwaitUsingPathArray
-
-local AwaitUsingPathStringParams = TypeGuard.Params(TypeGuard.String(), TypeGuard.Number():Optional(), TypeGuard.Boolean():Optional())
---- Waits until a value is not nil at the given path defined by a string. The default timeout is 120 seconds.
-function GeneralStore:AwaitUsingPathString(PathString: string, Timeout: number?, BypassError: boolean?)
-    if (VALIDATE_PARAMS) then
-        AwaitUsingPathStringParams(PathString, Timeout, BypassError)
-    end
-
+-- Waits for a value
+function Store:Await(Path: StorePath, Timeout: number?): any
     local CorrectedTimeout = Timeout or DEFAULT_TIMEOUT
-    local Got = self:GetUsingPathString(PathString)
+    local Got = self:Get(Path)
 
     -- ~= nil as it could be false
     if (Got ~= nil) then
         return Got
     end
 
-    -- Timeout warning
-    local TimeoutCoroutine = task.delay(TIMEOUT_WARN, function()
-        warn(WARN_INFINITE_WAIT:format(PathString, debug.traceback()))
+    local Trace = debug.traceback()
+
+    -- Proxy for timeout OR the awaiting event, as we don't want to fire the awaiting event on timeout incase other coroutines are listening
+    local StringPath = GetPathString(Path or EMPTY_PATH)
+    local ValueSignal = self:_GetValueChangedSignalFlat(StringPath)
+
+    local Warning = task.delay(TIMEOUT_WARN, function()
+        warn(WARN_INFINITE_WAIT:format(StringPath, Trace))
     end)
 
-    local Result = self:GetValueChangedSignalUsingPathString(PathString):Wait(CorrectedTimeout, false)
-    task.cancel(TimeoutCoroutine)
+    local Result = ValueSignal:Wait(CorrectedTimeout)
+    task.cancel(Warning)
 
-    if (Result == nil and not BypassError) then
-        error(ERR_STORE_TIMEOUT_REACHED:format(PathString, CorrectedTimeout))
+    -- It timed out
+    if (Result == nil) then
+        error(ERR_STORE_TIMEOUT_REACHED:format(StringPath, CorrectedTimeout))
     end
 
     return Result
 end
-GeneralStore.awaitUsingPathString = GeneralStore.AwaitUsingPathString
+Store.await = Store.Await
 
-local GetValueChangedSignalUsingPathArrayParams = TypeGuard.Params(ValidStorePath:Optional())
--- Finds or creates a Signal which fires whenever the value at the given path defined by an array changes or is up-propagated.
-function GeneralStore:GetValueChangedSignalUsingPathArray(Path: StorePath?): typeof(XSignal)
-    Path = Path or EMPTY_PATH_ARRAY
-
-    if (VALIDATE_PARAMS) then
-        GetValueChangedSignalUsingPathArrayParams(Path)
-    end
-
-    return self:GetValueChangedSignalUsingPathString(GetPathString(Path))
+-- _GetValueChangedSignalFlat except takes a StorePath
+function Store:GetValueChangedSignal(Path: StorePath): RBXScriptSignal
+    return self:_GetValueChangedSignalFlat(GetPathString(Path))
 end
-GeneralStore.getValueChangedSignalUsingPathArray = GeneralStore.GetValueChangedSignalUsingPathArray
-GeneralStore.GetValueChangedSignal = GeneralStore.GetValueChangedSignalUsingPathArray
-GeneralStore.getValueChangedSignal = GeneralStore.GetValueChangedSignalUsingPathArray
+Store.getValueChangedSignal = Store.GetValueChangedSignal
 
-local GetValueChangedSignalUsingPathStringParams = TypeGuard.Params(TypeGuard.String():Optional())
--- Finds or creates a Signal which fires whenever the value at the given path defined by a string changes or is up-propagated.
-function GeneralStore:GetValueChangedSignalUsingPathString(Path: string?): typeof(XSignal)
-    Path = Path or EMPTY_STRING
-
-    if (VALIDATE_PARAMS) then
-        GetValueChangedSignalUsingPathStringParams(Path)
-    end
-
-    local Awaiting = self._Awaiting
-    local Found = Awaiting[Path]
-
-    if (Found) then
-        return Found
-    end
-
-    Found = XSignal.new()
-    Awaiting[Path] = Found
-    return Found
+function Store:GetSubValueChangedSignal(Path: StorePath): RBXScriptSignal
+    return self:_GetValueChangedSignalFlat(GetPathString(Path) .. "\255")
 end
-GeneralStore.getValueChangedSignalUsingPathString = GeneralStore.GetValueChangedSignalUsingPathString
 
-local SetMergeUsingPathArrayParams = TypeGuard.Params(ValidStorePath)
---- Merges a value into the store at the given path defined by an array. This will not overwrite existing tables, but will merge into them instead.
-function GeneralStore:SetMergeUsingPathArray(Path: StorePath, Value: any?)
-    if (VALIDATE_PARAMS) then
-        SetMergeUsingPathArrayParams(Path)
-    end
-
-    self:Merge(BuildFromPath(Path, Value == nil and RemoveNode or Value))
-end
-GeneralStore.setMergeUsingPathArray = GeneralStore.SetMergeUsingPathArray
-
-local MergeParams = TypeGuard.Params(TypeGuard.Object():Or(TypeGuard.Array()))
---- Merges a data structure into the existing store's structure.
-function GeneralStore:Merge(Data: any)
-    if (VALIDATE_PARAMS) then
-        MergeParams(Data)
-    end
-
-    local StoreData = self._Store
-    self:_Merge(EMPTY_STRING, Data, StoreData)
-    self:_PathWasChanged(EMPTY_STRING, StoreData)
-end
-GeneralStore.merge = GeneralStore.Merge
-
---- Defers value changed events for paths to the next
---- defer point. Useful for not rapidly updating non
---- leaf nodes for many changes on those leaf nodes
---- before a conceptual defer point (like beginning of
---- Heartbeat). Will only fire once with the latest value.
-function GeneralStore:_DeferEventFlat(PathString: string, New: any?)
+--[[
+    Defers value changed events for paths to the next
+    defer point. Useful for not rapidly updating non
+    leaf nodes for many changes on those leaf nodes
+    before a conceptual defer point (like beginning of
+    Heartbeat). E.g. updating a Store 10 times in a frame
+    and using a frame-long wait as defer point would only
+    fire the root event once. Useful for UI performance or
+    general state update hook performance.
+]]
+function Store:_DeferEventFlat(PathString: string, New: any?, Old: any?, Key: string, ParentPathName: string?)
     local Awaiting = self._Awaiting
 
     if (not Awaiting[PathString]) then
         return
     end
 
-    local DeferredEvents = self._DeferredEvents -- TODO: we might want to fire these in order
-    DeferredEvents[PathString] = New
+    local DeferredEvents = self._DeferredEvents -- TODO: order it
+    DeferredEvents[PathString] = {New, Old, Key, ParentPathName}
 
     if (not self._Deferring) then
         self._Deferring = true
 
-        self._DeferFunction(function()
+        self.DeferFunction(function()
             if (table.isfrozen(self)) then
                 return
             end
+
+            self._DeferredEvents = {}
+            self._Deferring = false
 
             for PathName, Change in DeferredEvents do
                 local Event = Awaiting[PathName]
 
                 if (Event) then
-                    Event:Fire(Change)
+                    local Value, Old = Change[1], Change[2]
+                    Event:Fire(Value, Old, Value == Old)
+                end
+
+                local ParentPathName = Change[4]
+
+                if (ParentPathName) then
+                    local ParentEvent = Awaiting[ParentPathName .. "\255"]
+        
+                    if (ParentEvent) then
+                        ParentEvent:Fire(Change[3], Change[1], Change[2])
+                    end
                 end
             end
-
-            self._DeferredEvents = {}
-            self._Deferring = false
         end)
     end
 end
 
--- Fires a signal when an atom or table was changed in a merge.
-function GeneralStore:_PathWasChanged(PathName: string, Value: any?, ParentPath: string)
-    self._PathToValue[PathName] = Value -- This has to be set first so coroutines resumed after see the correct state, otherwise weird issues with consecutive Awaits
+-- Creates or obtains the event corresponding to a path's value changing
+function Store:_GetValueChangedSignalFlat(AwaitingPath: string, SubValue: boolean?)
+    assert(AwaitingPath, ERR_AWAIT_PATH_NOT_GIVEN)
+    assert(type(AwaitingPath) == TYPE_STRING, ERR_AWAIT_PATH_NOT_STRING)
 
-    if (Value == nil) then
-        self._PathToParentPath[PathName] = nil
-    elseif (PathName ~= EMPTY_STRING) then
-        self._PathToParentPath[PathName] = ParentPath
+    -- TODO: move these into Connect?
+    local Awaiting = self._Awaiting
+        local Event = Awaiting[AwaitingPath]
+
+    if (Event) then
+        return Event
     end
 
-    if (typeof(Value) == TYPE_TABLE) then
-        self._NodeToPath[Value] = PathName
-    end
+    Event = XSignal.new()
+    Awaiting[AwaitingPath] = Event
+    return Event
+end
 
-    if (self._DeferFunction) then
-        self:_DeferEventFlat(PathName, Value)
+-- Fires a signal when an atom or table was changed in a merge
+function Store:_PathWasChanged(PathName: string, Value: any?, Old: any?, Key: string, ParentPathName: string?)
+    if (self.DeferFunction) then
+        self:_DeferEventFlat(PathName, Value, Old, Key, ParentPathName)
     else
-        local Event = self._Awaiting[PathName]
+        local Awaiting = self._Awaiting
+            local Event = Awaiting[PathName]
 
         if (Event) then
-            Event:Fire(Value)
+            Event:Fire(Value, Old, Value == Old)
+        end
+
+        if (ParentPathName) then
+            local ParentEvent = Awaiting[ParentPathName .. "\255"]
+
+            if (ParentEvent) then
+                ParentEvent:Fire(Key, Value, Old)
+            end
         end
     end
 
     if (self._DebugLog) then
-        print(LOG_CHANGE:format(PathName == EMPTY_STRING and "ROOT" or PathName, tostring(Value)))
+        PathName = (PathName == "" and "ROOT" or PathName)
+
+        if (Old ~= nil and Value ~= nil) then
+            if (Old == Value) then
+                --> Up-propagated
+                print(LOG_UP_PROPAGATE:format(PathName))
+            else
+                --> Changed
+                print(LOG_CHANGE:format(PathName, tostring(Old), tostring(Value)))
+            end
+        elseif (Old == nil and Value ~= nil) then
+            --> Creation
+            print(LOG_CREATE:format(PathName, tostring(Value)))
+        elseif (Old ~= nil and Value == nil) then
+            --> Destruction
+            print(LOG_DESTROY:format(PathName, tostring(Value)))
+        end
     end
 end
 
--- Separate merge procedure since recursion is necessary and params would be inconvenient to the user.
-function GeneralStore:_Merge(ParentPath, Data, Into)
-    local LastKeyType, LastValueType
-    local EnforceHomogeneousKeys = self._EnforceHomogeneousKeys
-    local EnforceHomogeneousValues = self._EnforceHomogeneousValues
+-- Separate merge procedure since recursion is necessary and params would be inconvenient to the user
+function Store:_Merge(ParentPath, Data, Into)
+    local ExistingKey = next(Into)
+    local LastType
 
-    if (EnforceHomogeneousKeys) then
-        local ExistingKey = next(Into)
-
-        if (ExistingKey) then
-            LastKeyType = typeof(ExistingKey)
-        end
-    end
-
-    if (EnforceHomogeneousValues) then
-        for _, Value in Data do
-            local ValueType = typeof(Value)
-
-            if (ValueType == TYPE_TABLE) then
-                continue
-            end
-
-            LastValueType = ValueType
-            break
-        end
+    if (ExistingKey) then
+        LastType = type(ExistingKey)
     end
 
     for Key, Value in Data do
         local ValuePath = ParentPath .. tostring(Key) .. FLAT_PATH_DELIMITER
         local ExistingValue = Into[Key]
-        local ExistingValueType = typeof(ExistingValue)
 
-        -- Only one key type can exist in a node
-        if (EnforceHomogeneousKeys) then
-            local KeyType = typeof(Key)
+        local KeyType = typeof(Key)
+        local ExistingValueType = type(ExistingValue)
 
-            if (not LastKeyType) then
-                LastKeyType = KeyType
-            end
-
-            -- Mixed key types bad bad bad bad bad
-            assert(KeyType == LastKeyType, ERR_MIXED_KEYS)
+        if (not LastType) then
+            LastType = KeyType
         end
 
-        -- Only one value type can co-exist with table value types in a node
-        if (EnforceHomogeneousValues and LastValueType) then
-            assert(ExistingValueType == TYPE_TABLE or ExistingValueType == LastValueType, ERR_MIXED_VALUES)
-        end
+        -- Mixed key types bad bad bad bad bad
+        assert(KeyType == LastType, ERR_MIXED_KEYS)
 
-        -- No change, so no need to fire off any events (which would otherwise happen)
         if (Value == ExistingValue) then
+            -- No change, so no need to fire off any events (which would otherwise happen)
             continue
         end
 
-        -- REMOVE_NODE is used in place of 'nil' in tables (since obviously
-        -- nil-ed values won't exist, so this acts as a signifier to remove)
-        if (Value == RemoveNode) then
+        if (Value == REMOVE_NODE) then
+            -- REMOVE_NODE is used in place of 'nil' in tables (since obviously
+            -- nil-ed values won't exist, so this acts as a signifier to remove)
+
             if (ExistingValue == nil) then
                 continue
             end
 
-            -- "Remove table" -> all awaiting events on sub-paths should be fired
             if (ExistingValueType == TYPE_TABLE) then
+                -- "Remove table" -> all awaiting events on sub-paths should be fired
                 Into[Key] = nil
 
-                PathTraverse(ExistingValue, ValuePath, function(NewPath, _, NewPathParent)
-                    self:_PathWasChanged(NewPath, nil, NewPathParent)
+                PathTraverse(ExistingValue, ValuePath, function(NewPath, OldValue, Key, ParentPath)
+                    self:_PathWasChanged(NewPath, nil, OldValue, Key, ParentPath)
                 end)
 
-                self:_PathWasChanged(ValuePath, nil, ParentPath)
+                self:_PathWasChanged(ValuePath, nil, ExistingValue, Key, ParentPath)
                 continue
             end
 
             -- "Remove atom" -> nullify, then signify path was changed to nil
             Into[Key] = nil
-            self:_PathWasChanged(ValuePath, nil, ParentPath)
+            self:_PathWasChanged(ValuePath, nil, ExistingValue, Key, ParentPath)
             continue
         end
 
-        -- Item is a sub-table -> recurse and then activate changed event (up-propagated)
-        if (typeof(Value) == TYPE_TABLE) then
-            if (ExistingValue == nil) then
+        if (type(Value) == TYPE_TABLE) then
+            -- Item is a sub-table -> recurse and then activate changed event (up-propagated)
+            local IsNew = (ExistingValue == nil)
+
+            if (IsNew) then
                 ExistingValue = {}
                 Into[Key] = ExistingValue
             end
 
             self:_Merge(ValuePath, Value, ExistingValue)
-            self:_PathWasChanged(ValuePath, ExistingValue, ParentPath)
+
+            if (IsNew) then
+                self:_PathWasChanged(ValuePath, ExistingValue, nil, Key, ParentPath)
+            else
+                self:_PathWasChanged(ValuePath, ExistingValue, ExistingValue, Key, ParentPath)
+            end
+
             continue
         end
 
-        -- Replacing a table -> fire all sub-paths with nil
         if (ExistingValueType == TYPE_TABLE) then
-            PathTraverse(ExistingValue, ValuePath, function(NewPath, _, NewPathParent)
-                self:_PathWasChanged(NewPath, nil, NewPathParent)
+            -- Replacing a table -> fire all sub-paths with nil
+            PathTraverse(ExistingValue, ValuePath, function(NewPath, OldValue, Key, ParentPath)
+                self:_PathWasChanged(NewPath, nil, OldValue, Key, ParentPath)
             end)
         end
 
         -- Existing value is nil or not equal to new value -> put in new value
         Into[Key] = Value
-        self:_PathWasChanged(ValuePath, Value, ParentPath)
+        self:_PathWasChanged(ValuePath, Value, ExistingValue, Key, ParentPath)
     end
 end
 
-local ArrayInsertUsingPathArrayParams = TypeGuard.Params(ValidStorePath, TypeGuard.Any(), TypeGuard.Number():Optional())
---- Inserts a value into an array node with an optional index.
-function GeneralStore:ArrayInsertUsingPathArray(Path: StorePath, Value: any, At: number?): number
-    if (VALIDATE_PARAMS) then
-        ArrayInsertUsingPathArrayParams(Path, Value, At)
-    end
-
-    return self:ArrayInsertUsingPathString(GetPathString(Path), Value, At)
-end
-GeneralStore.arrayInsertUsingPathArray = GeneralStore.ArrayInsertUsingPathArray
-
-local ArrayInsertUsingPathStringParams = TypeGuard.Params(TypeGuard.String(), TypeGuard.Any(), TypeGuard.Number():Optional())
---- Inserts a value into an array node with an optional index given a specifc path string to an array.
-function GeneralStore:ArrayInsertUsingPathString(PathString: string, Value: any, At: number?): number
-    if (VALIDATE_PARAMS) then
-        ArrayInsertUsingPathStringParams(PathString, Value, At)
-    end
-
-    local Found = self:GetUsingPathString(PathString)
-
-    local First = next(Found)
-    assert(First == nil or typeof(First) == TYPE_NUMBER, "Cannot insert into non-array")
-
-    At = At or #Found + 1
-    table.insert(Found, At, Value)
-
-    for Index = #Found, At, -1 do
-        local ChangedPathString = PathString .. tostring(Index) .. FLAT_PATH_DELIMITER
-        local NewValue = Found[Index]
-
-        self:_PathWasChanged(ChangedPathString, NewValue, PathString)
-
-        if (typeof(NewValue) == TYPE_TABLE) then
-            PathTraverse(NewValue, ChangedPathString, function(NewPath, SubValue, NewPathParent)
-                self:_PathWasChanged(NewPath, SubValue, NewPathParent)
-            end)
-        end
-    end
-
-    self:_UpPropagate(PathString)
-
-    return At
-end
-GeneralStore.arrayInsertUsingPathString = GeneralStore.ArrayInsertUsingPathString
-
-local ArrayRemoveUsingPathArrayParams = TypeGuard.Params(ValidStorePath, TypeGuard.Number():Optional())
---- Removes an element from an array node with an optional specific index.
-function GeneralStore:ArrayRemoveUsingPathArray(Path: StorePath, At: number?): (any?, number)
-    if (VALIDATE_PARAMS) then
-        ArrayRemoveUsingPathArrayParams(Path, At)
-    end
-
-    return self:ArrayRemoveUsingPathString(GetPathString(Path), At)
-end
-GeneralStore.arrayRemoveUsingPathArray = GeneralStore.ArrayRemoveUsingPathArray
-
-local ArrayRemoveUsingPathStringParams = TypeGuard.Params(TypeGuard.String(), TypeGuard.Number():Optional())
---- Removes an element from an array node with an optional specific index given a specifc path string to an array.
-function GeneralStore:ArrayRemoveUsingPathString(PathString: string, At: number?): (any?, number)
-    if (VALIDATE_PARAMS) then
-        ArrayRemoveUsingPathStringParams(PathString, At)
-    end
-
-    local Found = self:GetUsingPathString(PathString)
-
-    local First = next(Found)
-    assert(First == nil or typeof(First) == TYPE_NUMBER, "Cannot insert into non-array")
-
-    local OriginalSize = #Found
-
-    if (OriginalSize == 0) then
-        return nil, 0
-    end
-
-    At = At or OriginalSize
-
-    local RemovingValue = Found[At]
-    local RemovingPath = PathString .. tostring(At) .. FLAT_PATH_DELIMITER
-
-    if (typeof(RemovingValue) == TYPE_TABLE) then
-        PathTraverse(RemovingValue, RemovingPath, function(NewPath, _, NewPathParent)
-            self:_PathWasChanged(NewPath, nil, NewPathParent)
-        end)
-    end
-
-    table.remove(Found, At)
-
-    for Index = OriginalSize, At, -1 do
-        local ChangedPathString = PathString .. tostring(Index) .. FLAT_PATH_DELIMITER
-        local NewValue = Found[Index]
-
-        self:_PathWasChanged(ChangedPathString, NewValue, PathString)
-
-        if (typeof(NewValue) == TYPE_TABLE) then
-            PathTraverse(NewValue, ChangedPathString, function(NewPath, SubValue, NewPathParent)
-                self:_PathWasChanged(NewPath, SubValue, NewPathParent)
-            end)
-        end
-    end
-
-    self:_UpPropagate(PathString)
-
-    return RemovingValue, At
-end
-GeneralStore.arrayRemoveUsingPathString = GeneralStore.ArrayRemoveUsingPathString
-
-local IncrementUsingPathArrayParams = TypeGuard.Params(ValidStorePath, TypeGuard.Number():Optional(), TypeGuard.Number():Optional())
---- Increments a numerical value at a given path.
-function GeneralStore:IncrementUsingPathArray(Path: StorePath, By: number?, Default: number?): number
-    if (VALIDATE_PARAMS) then
-        IncrementUsingPathArrayParams(Path, By, Default)
-    end
-
-    By = By or 1
-
-    local RootPath = GetPathString(Path)
-    local Found = self:GetUsingPathString(RootPath)
-
-    if (Found == nil) then
-        if (Default == nil) then
-            error("Found no parent for path: " .. RootPath)
-        end
-
-        Found = Default
-    end
-
-    local Result = Found + By
-    local FoundType = typeof(Found)
-
-    if (FoundType ~= TYPE_NUMBER) then
-        error(("Cannot increment non-number at path '%s' (got %s)"):format(RootPath, FoundType))
-    end
-
-    self:SetUsingPathArray(Path, Result)
-    return Result
-end
-GeneralStore.incrementUsingPathArray = GeneralStore.IncrementUsingPathArray
-
-local GetPathFromNodeParams = TypeGuard.Params(TypeGuard.Object())
---- Returns the path string of a given node - works for nodes but not atoms.
-function GeneralStore:GetPathFromNode(Node: any): string?
-    if (VALIDATE_PARAMS) then
-        GetPathFromNodeParams(Node)
-    end
-
-    return self._NodeToPath[Node]
-end
-
-local GetParentPathFromPathStringParams = TypeGuard.Params(TypeGuard.String())
---- Attempts to find the parent of a given path - works for nodes & atoms.
-function GeneralStore:GetParentPathFromPathString(Path: string): any?
-    if (VALIDATE_PARAMS) then
-        GetParentPathFromPathStringParams(Path)
-    end
-
-    return self._PathToParentPath[Path]
-end
-
-local GetParentFromNodeParams = TypeGuard.Params(TypeGuard.Object())
---- Attempts to find the parent of a given node - works for nodes but not atoms.
-function GeneralStore:GetParentFromNode(Node: any): any?
-    if (VALIDATE_PARAMS) then
-        GetParentFromNodeParams(Node)
-    end
-
-    local NodePath = self:GetPathFromNode(Node)
-
-    if (not NodePath) then
-        return nil
-    end
-
-    local NodeParentPath = self:GetParentPathFromPathString(NodePath)
-
-    if (not NodeParentPath) then
-        return nil
-    end
-
-    return self:GetUsingPathString(NodeParentPath)
-end
-GeneralStore.getParentFromNode = GeneralStore.GetParentFromNode
-
-local IsNodeAncestorOfParams = TypeGuard.Params(TypeGuard.Object(), TypeGuard.Object())
---- Checks if node A is an ancestor of node B.
-function GeneralStore:IsNodeAncestorOf(A: any, B: any): boolean
-    if (VALIDATE_PARAMS) then
-        IsNodeAncestorOfParams(A, B)
-    end
-
-    local Parent = self:GetParentFromNode(B)
-
-    while (Parent) do
-        if (Parent == A) then
-            return true
-        end
-
-        Parent = self:GetParentFromNode(Parent)
-    end
-
-    return false
-end
-GeneralStore.isNodeAncestorOf = GeneralStore.IsNodeAncestorOf
-
---- Checks if node A is a descendant of node B.
-function GeneralStore:IsNodeDescendantOf(A: any, B: any): boolean
-    return self:IsNodeAncestorOf(B, A)
-end
-GeneralStore.isNodeDescendantOf = GeneralStore.IsNodeDescendantOf
-
-local IsPathStringAncestorOfPathParamsString = TypeGuard.Params(TypeGuard.String(), TypeGuard.String())
---- Checks if path A is an ancestor of path B.
-function GeneralStore:IsPathStringAncestorOfPathString(A: string, B: string): boolean
-    if (VALIDATE_PARAMS) then
-        IsPathStringAncestorOfPathParamsString(A, B)
-    end
-
-    local Parent = self:GetParentPathFromPathString(B)
-
-    while (Parent) do
-        if (Parent == A) then
-            return true
-        end
-
-        Parent = self:GetParentPathFromPathString(Parent)
-    end
-
-    return false
-end
-GeneralStore.isPathStringAncestorOfPathString = GeneralStore.IsPathStringAncestorOfPathString
-
---- Checks if path A is a descendant of path B.
-function GeneralStore:IsPathStringDescendantOfPathString(A: string, B: string): boolean
-    return self:IsPathStringAncestorOfPathString(B, A)
-end
-GeneralStore.isPathStringDescendantOfPathString = GeneralStore.IsPathStringDescendantOfPathString
-
---- Fires changed connections for all ascendant nodes of a given path.
-function GeneralStore:_UpPropagate(FromPath: string)
-    local Path = FromPath
-
-    while (Path) do
-        local ParentPath = self:GetParentPathFromPathString(Path)
-        self:_PathWasChanged(Path, self:GetUsingPathString(Path), ParentPath)
-        Path = ParentPath
-    end
-end
-
-local DebugLogParams = TypeGuard.Params(TypeGuard.Boolean())
--- Turns debug logging on or off, i.e. when DebugLog is on, it will log any data changes to the console.
-function GeneralStore:SetDebugLog(DebugLog: boolean)
-    if (VALIDATE_PARAMS) then
-        DebugLogParams(DebugLog)
-    end
-
+-- Turns debug logging on or off
+function Store:SetDebugLog(DebugLog: boolean)
     self._DebugLog = DebugLog
 end
-GeneralStore.setDebugLog = GeneralStore.SetDebugLog
 
-Cleaner.Wrap(GeneralStore)
+Store._REMOVE_NODE = REMOVE_NODE
+Store._PathTraverse = PathTraverse
+Store._InternalMerge = InternalMerge
+Store._GetPathString = GetPathString
+Store._BuildFromPath = BuildFromPath
 
-return GeneralStore
+-- For testing
+    function Store:_GetAwaitingCount(Path: StorePath): number
+        return self._AwaitingRefs[GetPathString(Path)]
+    end
+
+    function Store:_RawGetValueChangedSignal(Path: StorePath): RBXScriptSignal
+        return self._Awaiting[GetPathString(Path)]
+    end
+--
+
+Cleaner.Wrap(Store)
+
+export type Store = typeof(Store)
+
+--[[
+    -- Example usage
+
+    local Test = Store.new()
+    Test:SetDebugLog(true)
+    Test:Merge({
+        A = {
+            B = {
+                C = 5;
+                D = 10;
+            }
+        }
+    })
+
+    print("---")
+
+    Test:Merge({
+        A = {
+            B = {
+                C = 10;
+                D = REMOVE_NODE;
+            }
+        }
+    })
+
+    print("---")
+
+    Test:Merge({
+        A = {
+            D = 2
+        }
+    })
+
+    print("---")
+
+    Test:Merge({
+        A = REMOVE_NODE;
+    })
+]]
+
+return Store

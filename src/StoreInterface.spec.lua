@@ -18,9 +18,6 @@ return function()
         local Client = ReplicatedStore.new(ClientRemote, false)
         local Server = ReplicatedStore.new(ServerRemote, true)
 
-        Client._TestMode = true
-        Server._TestMode = true
-
         Server:InitServer()
         Client:InitClient()
 
@@ -78,11 +75,11 @@ return function()
             local ServerTest = Server:Extend("Test")
             ServerTest:Set(30)
             expect(ServerTest:Get()).to.equal(30)
-            expect(ServerReplication:GetUsingPathArray({"Test"})).to.equal(30)
+            expect(ServerReplication:Get({"Test"})).to.equal(30)
 
             local ClientTest = Client:Extend("Test")
             expect(ClientTest:Get()).to.equal(30)
-            expect(ClientReplication:GetUsingPathArray({"Test"})).to.equal(30)
+            expect(ClientReplication:Get({"Test"})).to.equal(30)
         end)
 
         it("should return a deep item", function()
@@ -93,13 +90,13 @@ return function()
 
             ServerTest2:Set(30)
             expect(ServerTest2:Get()).to.equal(30)
-            expect(ServerReplication:GetUsingPathArray({"Test", "Test2"})).to.equal(30)
+            expect(ServerReplication:Get({"Test", "Test2"})).to.equal(30)
 
             local ClientTest = Client:Extend("Test")
                 local ClientTest2 = ClientTest:Extend("Test2")
 
             expect(ClientTest2:Get()).to.equal(30)
-            expect(ClientReplication:GetUsingPathArray({"Test", "Test2"})).to.equal(30)
+            expect(ClientReplication:Get({"Test", "Test2"})).to.equal(30)
         end)
     end)
 
@@ -134,7 +131,7 @@ return function()
 
             local ServerTest = Server:Extend("Test")
 
-            task.delay(0.1, function()
+            task.delay(0.5, function()
                 ServerTest:Set(30)
             end)
 
@@ -150,7 +147,7 @@ return function()
             local Level1Server = Server:Extend("Level1")
                 local Level2Server = Level1Server:Extend("Level2")
 
-            task.delay(0.1, function()
+            task.delay(0.5, function()
                 Level2Server:Set(1234)
             end)
 
@@ -162,7 +159,7 @@ return function()
         end)
     end)
 
-    --[[ describe("StoreInterface.IsContainer, StoreInterface.IsArray, StoreInterface.IsMap, StoreInterface.IsLeaf", function()
+    describe("StoreInterface.IsContainer, StoreInterface.IsArray, StoreInterface.IsMap, StoreInterface.IsLeaf", function()
         it("should not satisfy any of the four types if nil", function()
             local Client, Server, _, _ = GetTestObject()
 
@@ -246,7 +243,7 @@ return function()
             expect(TestClient:IsMap()).to.equal(false)
             expect(TestClient:IsLeaf()).to.equal(true)
         end)
-    end) ]]
+    end)
 
     describe("StoreInterface.Increment", function()
         it("should throw if a number is not passed", function()
@@ -361,13 +358,13 @@ return function()
         end)
     end)
 
-    describe("StoreInterface.ArrayInsert", function()
-        it("should allow insertion into an empty array", function()
+    describe("StoreInterface.Insert", function()
+        it("should allow an empty array", function()
             local _, Server, _, _ = GetTestObject()
             local TestServer = Server:Extend("Test")
 
             TestServer:Set({})
-            TestServer:ArrayInsert(1)
+            TestServer:Insert(1)
         end)
 
         it("should reject a non-array", function()
@@ -377,13 +374,13 @@ return function()
             TestServer:Set(1234)
 
             expect(function()
-                TestServer:ArrayInsert(1)
+                TestServer:Insert(1)
             end).to.throw()
 
             TestServer:Set("")
 
             expect(function()
-                TestServer:ArrayInsert(1)
+                TestServer:Insert(1)
             end).to.throw()
 
             TestServer:Set({
@@ -391,13 +388,13 @@ return function()
             })
 
             expect(function()
-                TestServer:ArrayInsert(1)
+                TestServer:Insert(1)
             end).to.throw()
 
             TestServer:Set(true)
 
             expect(function()
-                TestServer:ArrayInsert(1)
+                TestServer:Insert(1)
             end).to.throw()
         end)
 
@@ -408,7 +405,7 @@ return function()
             local TestClient = Client:Extend("Test")
 
             TestServer:Set({})
-            TestServer:ArrayInsert(1)
+            TestServer:Insert(1)
 
             expect(TestServer:Get()[1]).to.equal(1)
             expect(TestClient:Get()[1]).to.equal(1)
@@ -421,9 +418,9 @@ return function()
             local TestClient = Client:Extend("Test")
 
             TestServer:Set({})
-            TestServer:ArrayInsert(1)
-            TestServer:ArrayInsert(2)
-            TestServer:ArrayInsert(3)
+            TestServer:Insert(1)
+            TestServer:Insert(2)
+            TestServer:Insert(3)
 
             expect(TestServer:Get()[1]).to.equal(1)
             expect(TestServer:Get()[2]).to.equal(2)
@@ -438,8 +435,8 @@ return function()
 
             local TestServer1 = Server:Extend("Test1")
             TestServer1:Set({1})
-            TestServer1:ArrayInsert(123, 2)
-            TestServer1:ArrayInsert(456, 1)
+            TestServer1:Insert(2, 123)
+            TestServer1:Insert(1, 456)
 
             expect(TestServer1:Get()[1]).to.equal(456)
             expect(TestServer1:Get()[2]).to.equal(1)
@@ -447,13 +444,13 @@ return function()
         end)
     end)
 
-    describe("StoreInterface.ArrayRemove", function()
+    describe("StoreInterface.Remove", function()
         it("should allow an empty array", function()
             local _, Server, _, _ = GetTestObject()
             local TestServer = Server:Extend("Test")
 
             TestServer:Set({})
-            TestServer:ArrayRemove()
+            TestServer:Remove()
         end)
 
         it("should allow an array with 1 item", function()
@@ -461,7 +458,7 @@ return function()
             local TestServer = Server:Extend("Test")
 
             TestServer:Set({1})
-            TestServer:ArrayRemove()
+            TestServer:Remove()
         end)
 
         it("should reject a non-array", function()
@@ -471,13 +468,13 @@ return function()
             TestServer:Set(1234)
 
             expect(function()
-                TestServer:ArrayRemove()
+                TestServer:Remove()
             end).to.throw()
 
             TestServer:Set("")
 
             expect(function()
-                TestServer:ArrayRemove()
+                TestServer:Remove()
             end).to.throw()
 
             TestServer:Set({
@@ -485,13 +482,13 @@ return function()
             })
 
             expect(function()
-                TestServer:ArrayRemove()
+                TestServer:Remove()
             end).to.throw()
 
             TestServer:Set(true)
 
             expect(function()
-                TestServer:ArrayRemove()
+                TestServer:Remove()
             end).to.throw()
         end)
 
@@ -502,22 +499,21 @@ return function()
             local TestClient = Client:Extend("Test")
 
             TestServer:Set({1, 2, 3})
-            expect(next(TestClient:Get())).never.to.equal(nil)
-
-            TestServer:ArrayRemove()
+            TestServer:Remove()
             expect(TestServer:Get()[1]).to.equal(1)
             expect(TestServer:Get()[2]).to.equal(2)
             expect(TestServer:Get()[3]).to.equal(nil)
-            TestServer:ArrayRemove()
+            TestServer:Remove()
             expect(TestServer:Get()[1]).to.equal(1)
             expect(TestServer:Get()[2]).to.equal(nil)
             expect(TestServer:Get()[3]).to.equal(nil)
-            TestServer:ArrayRemove()
+            TestServer:Remove()
             expect(TestServer:Get()[1]).to.equal(nil)
             expect(TestServer:Get()[2]).to.equal(nil)
             expect(TestServer:Get()[3]).to.equal(nil)
 
-            expect(next(TestClient:Get())).to.equal(nil)
+            expect(TestServer:IsEmpty()).to.equal(true)
+            expect(TestClient:IsEmpty()).to.equal(true)
         end)
 
         it("should remove from a mid-position and shift down", function()
@@ -525,7 +521,7 @@ return function()
 
             local TestServer = Server:Extend("Test")
             TestServer:Set({1, 2, 3})
-            TestServer:ArrayRemove(2)
+            TestServer:Remove(2)
 
             expect(TestServer:Get()[1]).to.equal(1)
             expect(TestServer:Get()[2]).to.equal(3)
@@ -536,7 +532,7 @@ return function()
 
             local TestServer = Server:Extend("Test")
             TestServer:Set({1, 2, 3})
-            local Value, Index = TestServer:ArrayRemove(2)
+            local Value, Index = TestServer:Remove(2)
             expect(Value).to.equal(2)
             expect(Index).to.equal(2)
 

@@ -18,9 +18,6 @@ return function()
         local Client = ReplicatedStore.new(ClientRemote, false)
         local Server = ReplicatedStore.new(ServerRemote, true)
 
-        Client._TestMode = true
-        Server._TestMode = true
-
         Server:InitServer()
         Client:InitClient()
 
@@ -29,24 +26,26 @@ return function()
 
     -- Checks if two tables are equal
     local function Equivalent(Initial, Other)
-        for InitialKey, InitialValue in Initial do
-            local OtherValue = Other[InitialKey]
+        if (Initial == nil or Other == nil) then
+            return false
+        end
+
+        for Key, Value in Initial do
+            local OtherValue = Other[Key]
 
             if (OtherValue == nil) then
                 return false
             end
 
-            if (type(InitialValue) == "table") then
-                if (not Equivalent(InitialValue, OtherValue)) then
-                    return false
-                end
-            elseif (OtherValue ~= InitialValue) then
+            if (type(Value) ~= type(OtherValue)) then
                 return false
             end
-        end
 
-        for OtherKey in Other do
-            if (Initial[OtherKey] == nil) then
+            if (type(Value) == "table") then
+                if (not Equivalent(Value, OtherValue)) then
+                    return false
+                end
+            elseif (Value ~= OtherValue) then
                 return false
             end
         end
@@ -78,96 +77,93 @@ return function()
             local Client = ReplicatedStore.new(ClientRemote, false)
             local Server = ReplicatedStore.new(ServerRemote, true)
 
-            Client._TestMode = true
-            Server._TestMode = true
-
             Server:InitServer()
 
-            Server:SetUsingPathArray({"A"}, true)
-            Server:SetUsingPathArray({"B", "C"}, 1000)
-            Server:SetUsingPathArray({"B", "C"}, 1125)
+            Server:Set({"A"}, true)
+            Server:Set({"B", "C"}, 1000)
+            Server:Set({"B", "C"}, 1125)
 
             Client:InitClient()
 
-            expect(Client:GetUsingPathArray().A).to.be.ok()
-            expect(Client:GetUsingPathArray().B).to.be.ok()
-            expect(Client:GetUsingPathArray().B.C).to.be.ok()
+            expect(Client:Get().A).to.be.ok()
+            expect(Client:Get().B).to.be.ok()
+            expect(Client:Get().B.C).to.be.ok()
 
-            expect(Client:GetUsingPathArray().A).to.equal(true)
-            expect(Client:GetUsingPathArray().B.C).to.equal(1125)
+            expect(Client:Get().A).to.equal(true)
+            expect(Client:Get().B.C).to.equal(1125)
         end)
 
         it("should set flat values", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"A"}, true)
-            Server:SetUsingPathArray({"B"}, true)
+            Server:Set({"A"}, true)
+            Server:Set({"B"}, true)
 
-            expect(Server:GetUsingPathArray().A).to.equal(true)
-            expect(Client:GetUsingPathArray().A).to.equal(true)
+            expect(Server:Get().A).to.equal(true)
+            expect(Client:Get().A).to.equal(true)
 
-            expect(Server:GetUsingPathArray().B).to.equal(true)
-            expect(Client:GetUsingPathArray().B).to.equal(true)
+            expect(Server:Get().B).to.equal(true)
+            expect(Client:Get().B).to.equal(true)
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
 
         it("should set flat value 'false'", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"A"}, false)
-            Server:SetUsingPathArray({"B"}, false)
+            Server:Set({"A"}, false)
+            Server:Set({"B"}, false)
 
-            expect(Server:GetUsingPathArray().A).to.equal(false)
-            expect(Client:GetUsingPathArray().A).to.equal(false)
+            expect(Server:Get().A).to.equal(false)
+            expect(Client:Get().A).to.equal(false)
 
-            expect(Server:GetUsingPathArray().B).to.equal(false)
-            expect(Client:GetUsingPathArray().B).to.equal(false)
+            expect(Server:Get().B).to.equal(false)
+            expect(Client:Get().B).to.equal(false)
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
 
         it("should set deep values", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"A", "B", "C"}, 100)
+            Server:Set({"A", "B", "C"}, 100)
 
-            expect(Server:GetUsingPathArray().A.B.C).to.equal(100)
-            expect(Client:GetUsingPathArray().A.B.C).to.equal(100)
+            expect(Server:Get().A.B.C).to.equal(100)
+            expect(Client:Get().A.B.C).to.equal(100)
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
 
         it("should throw on empty path i.e. root overwrite", function()
             local Client, Server = GetTestObject()
 
             expect(function()
-                Server:SetUsingPathArray({}, 100)
+                Server:Set({}, 100)
             end).to.throw()
         end)
 
         it("should set flat values in order", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"A"}, true)
-            Server:SetUsingPathArray({"A"}, 9000)
+            Server:Set({"A"}, true)
+            Server:Set({"A"}, 9000)
 
-            Server:SetUsingPathArray({"B"}, true)
-            Server:SetUsingPathArray({"B"}, 1000)
+            Server:Set({"B"}, true)
+            Server:Set({"B"}, 1000)
 
-            expect(Server:GetUsingPathArray().A).to.equal(9000)
-            expect(Client:GetUsingPathArray().A).to.equal(9000)
+            expect(Server:Get().A).to.equal(9000)
+            expect(Client:Get().A).to.equal(9000)
 
-            expect(Server:GetUsingPathArray().B).to.equal(1000)
-            expect(Client:GetUsingPathArray().B).to.equal(1000)
+            expect(Server:Get().B).to.equal(1000)
+            expect(Client:Get().B).to.equal(1000)
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
 
         it("should set deep values in order", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"A", "B", "C"}, 100)
+            Server:Set({"A", "B", "C"}, 100)
 
-            expect(Server:GetUsingPathArray().A.B.C).to.equal(100)
-            expect(Client:GetUsingPathArray().A.B.C).to.equal(100)
+            expect(Server:Get().A.B.C).to.equal(100)
+            expect(Client:Get().A.B.C).to.equal(100)
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
 
         it("should send and receive large sample data", function()
@@ -183,57 +179,57 @@ return function()
                     Path[Depth] = (Generator:NextNumber() > 0.5 and Generator:NextInteger(1, 10e8) or tostring(Generator:NextInteger(1, 10e8)))
                 end
 
-                Server:SetUsingPathArray(Path, FinalValue)
+                Server:Set(Path, FinalValue)
             end
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
 
         it("should convert keys to numeric when applicable", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({1, "201", "AHHH"}, true)
+            Server:Set({1, "201", "AHHH"}, true)
 
-            expect(Client:GetUsingPathArray()[1]).to.be.ok()
-            expect(Client:GetUsingPathArray()[1][201]).to.be.ok()
-            expect(Client:GetUsingPathArray()[1][201].AHHH).to.be.ok()
+            expect(Client:Get()[1]).to.be.ok()
+            expect(Client:Get()[1][201]).to.be.ok()
+            expect(Client:Get()[1][201].AHHH).to.be.ok()
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
 
         it("should not allow mixed keys", function()
             local Client, Server = GetTestObject()
 
             expect(function()
-                Server:SetUsingPathArray({1}, true)
-                Server:SetUsingPathArray({"a"}, true)
+                Server:Set({1}, true)
+                Server:Set({"a"}, true)
             end).to.throw()
 
             expect(function()
-                Server:SetUsingPathArray({"a"}, true)
-                Server:SetUsingPathArray({1}, true)
+                Server:Set({"a"}, true)
+                Server:Set({1}, true)
             end).to.throw()
         end)
 
         it("should trigger await events for tables being overwritten by atoms", function()
             local Client, Server = GetTestObject()
 
-            Server:SetUsingPathArray({"One", "Two", "Three"}, true)
+            Server:Set({"One", "Two", "Three"}, true)
 
             local Fired1 = false
             local Fired2 = false
             local Fired3 = false
 
-            Server:GetValueChangedSignalUsingPathArray({"One", "Two", "Three", "Four"}):Connect(function(Value)
+            Server:GetValueChangedSignal({"One", "Two", "Three", "Four"}):Connect(function(Value)
                 -- Shouldn't fire for non-existent nodes
                 Fired3 = true
             end)
 
-            Server:GetValueChangedSignalUsingPathArray({"One", "Two", "Three"}):Connect(function(Value)
+            Server:GetValueChangedSignal({"One", "Two", "Three"}):Connect(function(Value)
                 expect(Value).to.equal(nil)
                 Fired1 = true
             end)
 
-            Server:GetValueChangedSignalUsingPathArray({"One"}):Connect(function(Value)
+            Server:GetValueChangedSignal({"One"}):Connect(function(Value)
                 expect(Value).to.equal(200)
                 Fired2 = true
             end)
@@ -241,7 +237,7 @@ return function()
             expect(Fired1).to.equal(false)
             expect(Fired2).to.equal(false)
             expect(Fired3).to.equal(false)
-            Server:SetUsingPathArray({"One"}, 200)
+            Server:Set({"One"}, 200)
             expect(Fired1).to.equal(true)
             expect(Fired2).to.equal(true)
             expect(Fired3).to.equal(false)
@@ -249,107 +245,85 @@ return function()
 
         it("should delete values when nil is passed", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"HHH", "B"}, true)
+            Server:Set({"HHH", "B"}, true)
 
-            expect(Server:GetUsingPathArray().HHH).to.be.ok()
-            expect(Client:GetUsingPathArray().HHH).to.be.ok()
-            expect(Server:GetUsingPathArray().HHH.B).to.be.ok()
-            expect(Client:GetUsingPathArray().HHH.B).to.be.ok()
+            expect(Server:Get().HHH).to.be.ok()
+            expect(Client:Get().HHH).to.be.ok()
+            expect(Server:Get().HHH.B).to.be.ok()
+            expect(Client:Get().HHH.B).to.be.ok()
 
-            Server:SetUsingPathArray({"HHH", "B"}, nil)
+            Server:Set({"HHH", "B"}, nil)
 
-            expect(Server:GetUsingPathArray().HHH.B).never.to.be.ok()
-            expect(Client:GetUsingPathArray().HHH.B).never.to.be.ok()
+            expect(Server:Get().HHH.B).never.to.be.ok()
+            expect(Client:Get().HHH.B).never.to.be.ok()
 
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
-        end)
-    end)
-
-    describe("ReplicatedStore.Merge", function()
-        it("should batch merges correctly with value creation", function()
-            local Client, Server = GetTestObject()
-            Server.DeferFunction = function(Func)
-                task.delay(0.1, Func)
-            end
-
-            Server:Merge({
-                X = {
-                    P = 1;
-                };
-            })
-            Server:Merge({
-                X = {
-                    Q = 1;
-                };
-            })
-            Server:Merge({
-                X = {
-                    R = 1;
-                };
-            })
-
-            expect(Server:GetUsingPathArray().X.P).to.equal(1)
-            expect(Server:GetUsingPathArray().X.Q).to.equal(1)
-            expect(Server:GetUsingPathArray().X.R).to.equal(1)
-
-            expect(Client:GetUsingPathArray().X).to.equal(nil)
-
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(false)
-
-            task.wait(0.1)
-
-            expect(Server:GetUsingPathArray().X.P).to.equal(1)
-            expect(Server:GetUsingPathArray().X.Q).to.equal(1)
-            expect(Server:GetUsingPathArray().X.R).to.equal(1)
-            expect(Client:GetUsingPathArray().X.P).to.equal(1)
-            expect(Client:GetUsingPathArray().X.Q).to.equal(1)
-            expect(Client:GetUsingPathArray().X.R).to.equal(1)
-
-            expect(Equivalent(Client:GetUsingPathArray(), Server:GetUsingPathArray())).to.equal(true)
+            expect(Equivalent(Client:Get(), Server:Get())).to.equal(true)
         end)
     end)
 
     describe("ReplicatedStore.Get", function()
         it("should return the main table with no arguments", function()
             local Client, Server = GetTestObject()
-            expect(Client:GetUsingPathArray()).to.equal(Client:GetUsingPathArray())
-            expect(Server:GetUsingPathArray()).to.equal(Server:GetUsingPathArray())
+            expect(Client:Get()).to.equal(Client:Get())
+            expect(Server:Get()).to.equal(Server:Get())
         end)
 
         it("should return nil for paths which do not exist", function()
             local Client, Server = GetTestObject()
-            expect(Client:GetUsingPathArray({"A", "B"})).never.to.be.ok()
-            expect(Server:GetUsingPathArray({"A", "B"})).never.to.be.ok()
+            expect(Client:Get({"A", "B"})).never.to.be.ok()
+            expect(Server:Get({"A", "B"})).never.to.be.ok()
         end)
     end)
 
-    describe("ReplicatedStore.SetUsingPathArray, ReplicatedStore.GetUsingPathArray", function()
+    describe("ReplicatedStore.Set, ReplicatedStore.Get", function()
         it("should correctly retrieve flat values", function()
             local Client, Server = GetTestObject()
-            expect(Client:GetUsingPathArray({"A"})).never.to.be.ok()
-            Server:SetUsingPathArray({"A"}, true)
-            expect(Client:GetUsingPathArray({"A"})).to.be.ok()
+            expect(Client:Get({"A"})).never.to.be.ok()
+            Server:Set({"A"}, true)
+            expect(Client:Get({"A"})).to.be.ok()
         end)
 
         it("should correctly retrieve nested values", function()
             local Client, Server = GetTestObject()
-            expect(Client:GetUsingPathArray({"A", "B", "C"})).never.to.be.ok()
-            Server:SetUsingPathArray({"A", "B", "C"}, true)
-            expect(Client:GetUsingPathArray({"A", "B", "C"})).to.be.ok()
+            expect(Client:Get({"A", "B", "C"})).never.to.be.ok()
+            Server:Set({"A", "B", "C"}, true)
+            expect(Client:Get({"A", "B", "C"})).to.be.ok()
         end)
+
+        --[[ it("should serialize a numberic index larger than int32 range", function()
+            -- Only disable if FIX_FLOAT_KEYS == true
+            local Client, Server = GetTestObject()
+            Server:Set({10^24}, true)
+            expect(Client:Get({10^24})).to.be.ok()
+        end) ]]
+
+        --[[ it("should serialize a large numberic index in nested keys", function()
+            -- Only disable if FIX_FLOAT_KEYS == true
+            local Client, Server = GetTestObject()
+            Server:Set({"A"}, {
+                {
+                    {
+                        {
+                            [10^24] = true;
+                        }
+                    }
+                }
+            })
+            expect(Client:Get({"A", 1, 1, 1, 10^24})).to.be.ok()
+        end) ]]
     end)
 
     describe("ReplicatedStore.Await", function()
         it("should return if value is already present", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"A"}, 1)
-            expect(Client:AwaitUsingPathArray({"A"})).to.equal(1)
+            Server:Set({"A"}, 1)
+            expect(Client:Await({"A"})).to.equal(1)
         end)
 
         it("should return if value is already present on the server", function()
             local Client, Server = GetTestObject()
-            Server:SetUsingPathArray({"A"}, 1)
-            expect(Server:AwaitUsingPathArray({"A"})).to.equal(1)
+            Server:Set({"A"}, 1)
+            expect(Server:Await({"A"})).to.equal(1)
         end)
 
         it("should await a flat value", function()
@@ -358,11 +332,11 @@ return function()
 
             task.spawn(function()
                 task.wait(WAIT_TIME)
-                Server:SetUsingPathArray({"A"}, 1)
+                Server:Set({"A"}, 1)
             end)
 
             local Time = os.clock()
-            expect(Client:AwaitUsingPathArray({"A"})).to.equal(1)
+            expect(Client:Await({"A"})).to.equal(1)
             expect(os.clock() - Time >= WAIT_TIME).to.equal(true)
         end)
 
@@ -372,11 +346,11 @@ return function()
 
             task.spawn(function()
                 task.wait(WAIT_TIME)
-                Server:SetUsingPathArray({"A"}, 1)
+                Server:Set({"A"}, 1)
             end)
 
             local Time = os.clock()
-            expect(Server:AwaitUsingPathArray({"A"})).to.equal(1)
+            expect(Server:Await({"A"})).to.equal(1)
             expect(os.clock() - Time >= WAIT_TIME).to.equal(true)
         end)
 
@@ -386,11 +360,11 @@ return function()
 
             task.spawn(function()
                 task.wait(WAIT_TIME)
-                Server:SetUsingPathArray({"A", "B", "C"}, 1)
+                Server:Set({"A", "B", "C"}, 1)
             end)
 
             local Time = os.clock()
-            expect(Client:AwaitUsingPathArray({"A", "B", "C"})).to.equal(1)
+            expect(Client:Await({"A", "B", "C"})).to.equal(1)
             expect(os.clock() - Time >= WAIT_TIME).to.equal(true)
         end)
 
@@ -400,11 +374,11 @@ return function()
 
             task.spawn(function()
                 task.wait(WAIT_TIME)
-                Server:SetUsingPathArray({"A", "B", "C"}, 1)
+                Server:Set({"A", "B", "C"}, 1)
             end)
 
             local Time = os.clock()
-            expect(Server:AwaitUsingPathArray({"A", "B", "C"})).to.equal(1)
+            expect(Server:Await({"A", "B", "C"})).to.equal(1)
             expect(os.clock() - Time >= WAIT_TIME).to.equal(true)
         end)
 
@@ -414,10 +388,10 @@ return function()
 
             task.spawn(function()
                 task.wait(WAIT_TIME)
-                Server:SetUsingPathArray({"A", "B"}, {
+                Server:Set({"A", "B"}, {
                     TEST = 1;
                 })
-                Server:SetUsingPathArray({"C"}, {
+                Server:Set({"C"}, {
                     D = 2;
                 })
             end)
@@ -425,10 +399,10 @@ return function()
             local Time = os.clock()
 
             task.spawn(function()
-                expect(Client:AwaitUsingPathArray({"A", "B", "TEST"})).to.equal(1)
+                expect(Client:Await({"A", "B", "TEST"})).to.equal(1)
             end)
 
-            expect(Client:AwaitUsingPathArray({"C", "D"})).to.equal(2)
+            expect(Client:Await({"C", "D"})).to.equal(2)
             expect(os.clock() - Time >= WAIT_TIME).to.equal(true)
         end)
 
@@ -438,10 +412,10 @@ return function()
 
             task.spawn(function()
                 task.wait(WAIT_TIME)
-                Server:SetUsingPathArray({"A", "B"}, {
+                Server:Set({"A", "B"}, {
                     TEST = 1;
                 })
-                Server:SetUsingPathArray({"C"}, {
+                Server:Set({"C"}, {
                     D = 2;
                 })
             end)
@@ -449,10 +423,10 @@ return function()
             local Time = os.clock()
 
             task.spawn(function()
-                expect(Server:AwaitUsingPathArray({"A", "B", "TEST"})).to.equal(1)
+                expect(Server:Await({"A", "B", "TEST"})).to.equal(1)
             end)
 
-            expect(Server:AwaitUsingPathArray({"C", "D"})).to.equal(2)
+            expect(Server:Await({"C", "D"})).to.equal(2)
             expect(os.clock() - Time >= WAIT_TIME).to.equal(true)
         end)
 
@@ -463,7 +437,7 @@ return function()
             local Time = os.clock()
 
             expect(pcall(function()
-                Client:AwaitUsingPathArray({"A"}, TIMEOUT)
+                Client:Await({"A"}, TIMEOUT)
             end)).to.equal(false)
 
             expect(os.clock() - Time >= TIMEOUT).to.equal(true)

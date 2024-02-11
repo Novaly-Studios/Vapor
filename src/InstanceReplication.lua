@@ -7,38 +7,32 @@ local StoreInterface = require(script.Parent:WaitForChild("StoreInterface"))
 local ReplicatedStore = require(script.Parent:WaitForChild("ReplicatedStore"))
 
 local VALIDATE_PARAMS = true
-local REMOTE_WAIT_TIMEOUT = 60
+local REMOTE_WAIT_TIMEOUT = 120
 
 local TYPE_INSTANCE = "Instance"
 local TYPE_REMOTE_EVENT = "RemoteEvent"
 
-local CLIENT_PARTITION_TAG = "ClientPartition"
-
 local ERR_ROOT_TYPE = "Instance expected, got %s"
 local ERR_REMOTE_TIME_OUT = "Wait for partition timed out: %s"
 local ERR_ROOT_DEPARENTED = "Instance was already deparented"
-local ERR_PARTITION_ALREADY_TAKEN = "Partition already taken: %s"
-local ERR_PARTITION_ALREADY_ACTIVE = "Partition already active: %s"
 
-local InstanceReplication = {}
-InstanceReplication.__index = InstanceReplication
-InstanceReplication.ReplicatedStoreCache = {}
+local Cache = {}
 
 local ClientParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), TypeGuard.Boolean():Optional())
 
-local function Client(Root: Instance, PartitionName: string, ShouldYieldOnRemove: boolean?)
+local function Client<T>(Root: Instance, PartitionName: string, ShouldYieldOnRemove: boolean?): (StoreInterface.Type<T>, ReplicatedStore.ReplicatedStore)
     if (VALIDATE_PARAMS) then
         ClientParams(Root, PartitionName, ShouldYieldOnRemove)
     end
 
     local Remote = Root:WaitForChild(PartitionName, REMOTE_WAIT_TIMEOUT)
+    assert(Remote, ERR_REMOTE_TIME_OUT:format(PartitionName))
+    assert(Root:IsDescendantOf(game), ERR_ROOT_DEPARENTED)
 
-    if (not Remote) then
-        error(ERR_REMOTE_TIME_OUT:format(PartitionName))
-    end
+    local Cached = Cache[Remote]
 
-    if (Remote:GetAttribute(CLIENT_PARTITION_TAG)) then
-        error(ERR_PARTITION_ALREADY_ACTIVE:format(PartitionName))
+    if (Cached) then
+        return unpack(Cached)
     end
 
     local CleanerObject = Cleaner.new()
@@ -48,48 +42,58 @@ local function Client(Root: Instance, PartitionName: string, ShouldYieldOnRemove
     CleanerObject:Add(ReplicationObject)
 
     local Interface = StoreInterface.new(ReplicationObject)
-    CleanerObject:Add(Interface)
-
     local CurrentLocation = Remote:GetFullName()
 
-    CleanerObject:Add(Remote.AncestryChanged:Connect(function(_, NewParent)
+    CleanerObject:Add(Remote.AncestryChanged:Connect(function()
         if (ShouldYieldOnRemove) then
             task.wait()
         end
 
-        if (NewParent == nil) then
-            print("[InstanceReplication] Remote deparented: " .. CurrentLocation)
-            CleanerObject:Clean()
-        else
+        if (Remote:IsDescendantOf(game)) then
             CurrentLocation = Remote:GetFullName()
+        else
+            print("[InstanceReplication] Remote deparented: " .. CurrentLocation)
+            Cache[Remote] = nil
+            CleanerObject:Clean()
         end
     end))
 
-    Remote:SetAttribute(CLIENT_PARTITION_TAG, true)
+    Cache[Remote] = {Interface, ReplicationObject}
 
     return Interface, ReplicationObject
 end
 
-local ServerParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), TypeGuard.Number():Optional(), TypeGuard.Boolean():Optional())
+local ServerParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), (TypeGuard.Number():Or(TypeGuard.String("Defer"))):Optional(), TypeGuard.Boolean():Optional())
 
-local function Server(Root: Instance, PartitionName: string, Interval: number?, ShouldYieldOnRemove: boolean?)
+local function Server<T>(Root: Instance, PartitionName: string, Interval: (number | "Defer")?, ShouldYieldOnRemove: boolean?): (StoreInterface.Type<T>, ReplicatedStore.ReplicatedStore)
     if (VALIDATE_PARAMS) then
         ServerParams(Root, PartitionName, Interval, ShouldYieldOnRemove)
     end
 
     assert(typeof(Root) == TYPE_INSTANCE, ERR_ROOT_TYPE:format(typeof(Root)))
-    assert(Root.Parent ~= nil, ERR_ROOT_DEPARENTED)
-    assert(Root:FindFirstChild(PartitionName) == nil, ERR_PARTITION_ALREADY_TAKEN:format(PartitionName))
+    assert(Root:IsDescendantOf(game), ERR_ROOT_DEPARENTED)
 
     local Remote = Instance.new(TYPE_REMOTE_EVENT)
     Remote.Name = PartitionName
 
+    local Cached = Cache[Remote]
+
+    if (Cached) then
+        return unpack(Cached)
+    end
+
     local CleanerObject = Cleaner.new()
     local ReplicationObject = ReplicatedStore.new(Remote, true)
 
-    if (Interval and Interval > 0) then
-        ReplicationObject.DeferFunction = function(Callback)
-            task.delay(Interval, Callback)
+    if (Interval) then
+        if (Interval == "Defer") then
+            ReplicationObject.DeferFunction = function(Callback)
+                task.defer(Callback)
+            end
+        elseif (Interval > 0) then
+            ReplicationObject.DeferFunction = function(Callback)
+                task.delay(Interval, Callback)
+            end
         end
     end
 
@@ -97,25 +101,24 @@ local function Server(Root: Instance, PartitionName: string, Interval: number?, 
     CleanerObject:Add(ReplicationObject)
 
     local Interface = StoreInterface.new(ReplicationObject)
-    CleanerObject:Add(Interface)
-
     local CurrentLocation = Remote:GetFullName()
 
-    CleanerObject:Add(Remote.AncestryChanged:Connect(function(_, NewParent)
-        if (NewParent == nil) then
+    CleanerObject:Add(Remote.AncestryChanged:Connect(function()
+        if (Remote:IsDescendantOf(game)) then
+            CurrentLocation = Remote:GetFullName()
+        else
             if (ShouldYieldOnRemove) then
                 task.wait()
             end
 
             print("[InstanceReplication] Remote deparented: " .. CurrentLocation)
+            Cache[Remote] = nil
             CleanerObject:Clean()
-        else
-            CurrentLocation = Remote:GetFullName()
         end
     end))
 
     Remote.Parent = Root
-
+    Cache[Remote] = {Interface, ReplicationObject}
     return Interface, ReplicationObject
 end
 
