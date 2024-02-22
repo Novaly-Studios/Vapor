@@ -3,7 +3,7 @@ local Players = game:GetService("Players")
 
 local GeneralStore = require(script.Parent:WaitForChild("GeneralStore"))
 local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
-local Signal = require(script.Parent.Parent:WaitForChild("Signal"))
+local XSignal = require(script.Parent.Parent:WaitForChild("XSignal"))
 
 local REMOVE_NODE = GeneralStore._REMOVE_NODE
 local BuildFromPath = GeneralStore._BuildFromPath
@@ -120,7 +120,7 @@ function ReplicatedStore.new(RemoteEvent, IsServer: boolean)
 
         _RemoteEvent = RemoteEvent;
 
-        OnDefer = Signal.new();
+        OnDefer = XSignal.new();
     };
 
     return setmetatable(self, ReplicatedStore)
