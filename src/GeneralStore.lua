@@ -39,7 +39,6 @@ local ERR_NO_PATH_GIVEN = NAME_PREFIX .. "No path given!"
 -- Don't change...
 local REMOVE_NODE = {REMOVE_NODE = true}
 local EMPTY_PATH = {}
-local WEAK_MT = {__mode = "v"}
 
 -----------------------------------------------------------------------------------
 local function PathTraverse(Root: GeneralStoreStructure, Path: string, Callback: (string, any, string, string) -> ())
@@ -120,7 +119,7 @@ local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: a
     local _Deferring = false
     local _Destroyed = false
     local _DebugLog = false
-    local _Awaiting = setmetatable({}, WEAK_MT) -- Awaiting: {[PathString]: Signal}
+    local _Awaiting = {} -- Awaiting: {[PathString]: Signal}
 
     --- Destroys the store, firing nil to all sub-values & disconnecting all events.
     local function Destroy()
@@ -384,6 +383,12 @@ local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: a
     end
     self.Clear = Clear
 
+    local SignalLock = {
+        __index = function(self, Key)
+            error("Signal was cleaned and locked as all connections were disconnected", 2)
+        end;
+    }
+
     --- Creates or obtains the event corresponding to a path's value changing.
     local function _GetValueChangedSignalFlat(AwaitingPath: string, SubValue: boolean?)
         assert(AwaitingPath, ERR_AWAIT_PATH_NOT_GIVEN)
@@ -394,8 +399,39 @@ local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: a
             return Event
         end
 
-        Event = XSignal.new()
+        local Event = XSignal.new()
         _Awaiting[AwaitingPath] = Event
+
+        --[[ do
+            -- Posisble mode in future: registered by default, until connection count returns to 0.
+            -- This way we don't necessarily maintain the signal reference until whole GeneralStore is GC'ed.
+
+            local Count = 0
+            local OriginalConnect = Event.Connect
+
+            function Event:Connect(Callback)
+                Count += 1
+
+                local Connection = OriginalConnect(self, Callback)
+                    local OriginalDisconnect = Connection.Disconnect
+
+                function Connection:Disconnect()
+                    OriginalDisconnect(self)
+                    Count -= 1
+                    if (Count == 0) then
+                        _Awaiting[AwaitingPath] = nil
+                    end
+
+                    setmetatable(Event, SignalLock)
+                    if (not table.isfrozen(Event)) then
+                        table.freeze(Event)
+                    end
+                end
+                
+                return Connection
+            end
+        end ]]
+
         return Event
     end
 
