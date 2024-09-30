@@ -1,20 +1,17 @@
-local GeneralStore = require(script:WaitForChild("GeneralStore"));
-export type RawStore = GeneralStore.RawStore;
-export type Store = GeneralStore.Store;
+local InstanceReplication = require(script.InstanceReplication)
+local ReplicatedStore = require(script.ReplicatedStore)
 
-local StoreInterface = require(script:WaitForChild("StoreInterface"));
-export type Node<T> = StoreInterface.Node<T>;
-export type ArrayNode<T> = StoreInterface.ArrayNode<T>;
-export type CollectionNode<K, V> = StoreInterface.CollectionNode<K, V>;
+local StoreInterface = require(script.StoreInterface)
+    export type Node<T> = StoreInterface.Node<T>
+    export type ArrayNode<T> = StoreInterface.ArrayNode<T>
+    export type CollectionNode<K, V> = StoreInterface.CollectionNode<K, V>
 
-local ReplicatedStore = require(script:WaitForChild("ReplicatedStore"));
-export type ReplicatedStore = ReplicatedStore.ReplicatedStore;
-
-local InstanceReplication = require(script:WaitForChild("InstanceReplication"));
+local GeneralStore = require(script.GeneralStore)
+    export type GeneralStoreStructure = GeneralStore.GeneralStoreStructure
 
 return {
-    GeneralStore = GeneralStore;
-    StoreInterface = StoreInterface;
-    ReplicatedStore = ReplicatedStore;
     InstanceReplication = InstanceReplication;
+    ReplicatedStore = ReplicatedStore;
+    StoreInterface = StoreInterface;
+    GeneralStore = GeneralStore;
 };

@@ -1,67 +1,58 @@
+--!native
+--!optimize 2
 --!nonstrict
 local Players = game:GetService("Players")
 
-local GeneralStore = require(script.Parent:WaitForChild("GeneralStore"))
-local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
-local XSignal = require(script.Parent.Parent:WaitForChild("XSignal"))
+local GeneralStore = require(script.Parent.GeneralStore)
+local TableUtil = require(script.Parent.Parent.TableUtil)
+    local Map = TableUtil.Map.Map or TableUtil.Map.Map1D
+local XSignal = require(script.Parent.Parent.XSignal)
 
-local REMOVE_NODE = GeneralStore._REMOVE_NODE
+local FlatPathDelimiter = GeneralStore._FlatPathDelimiter
 local BuildFromPath = GeneralStore._BuildFromPath
+local RemoveNode = GeneralStore._RemoveNode
 
+type GeneralStoreStructure = GeneralStore.GeneralStoreStructure
+type GeneralStorePath = GeneralStore.GeneralStorePath
+type SendTo = {Player | string}
+
+local DEFAULT_MERGE_CATEGORY = "*"
+local REPLICATE_PROCESS_TAG = "ReplicatedStore.Incoming"
 local EMPTY_PATH = {}
 
--- Microprofiler tags
-local REPLICATE_PROCESS_TAG = "ReplicatedStore.Incoming"
-
--- More strings
-local DEFAULT_MERGE_CATEGORY = "*"
-
--- Types
-local TYPE_TABLE = "table"
-type RawStore = GeneralStore.RawStore
-type StorePath = GeneralStore.StorePath
-
--- Logs, warnings & errors
 local ERR_ROOT_OVERWRITE = "Attempt to set root table (path empty)"
 local ERR_NO_PATH_GIVEN = "No path given!"
 
--- Settings
 local MERGE_LIST_DEFAULT_SIZE = Players.MaxPlayers
 local DEBUG_WARN_PATH_CONVERT = true
-local PROFILE_FUNCTIONS = false
 
 -----------------------------------------------------------------------------------
 
 local InternalMerge = GeneralStore._InternalMerge
 
--- TODO: test performance of mutable versions
-local function SerializeIncomingData(Data: RawStore): RawStore
-    local Result = {}
+local function ConvertIncomingData(Data: GeneralStoreStructure): GeneralStoreStructure
+    local Result = table.clone(Data)
+    local Remove
 
     for Key, Value in Data do
-        if (type(Value) == TYPE_TABLE) then
-            if (Value.REMOVE_NODE) then
-                Value = REMOVE_NODE
-            else
-                Value = SerializeIncomingData(Value)
-            end
+        if (type(Value) == "table") then
+            Value = ConvertIncomingData(Value)
         end
 
-        Result[tonumber(Key) or Key] = Value
+        local AsNumber = tonumber(Key)
+        if (AsNumber and AsNumber ~= Key) then
+            Remove = Remove or {}
+            table.insert(Remove, Key)
+            Key = AsNumber
+        end
+
+        Result[Key] = Value
     end
 
-    return Result
-end
-
-local function ConvertToStringIndices(Data: RawStore): RawStore
-    local Result = {}
-
-    for Key, Value in Data do
-        if (type(Value) == TYPE_TABLE) then
-            Value = ConvertToStringIndices(Value)
+    if (Remove) then
+        for _, Key in Remove do
+            Result[Key] = nil
         end
-
-        Result[tostring(Key)] = Value
     end
 
     return Result
@@ -69,16 +60,13 @@ end
 
 local ConvertPathToNumericRegistry = setmetatable({}, {__mode = "k"})
 
--- Converts an array's elements to all numerics
--- TODO: maybe mutate path (faster) and convert, mark as done so we don't re-process lots
--- TODO: just warn in merge procedure?
-local function ConvertPathToNumeric(Path: StorePath)
+-- Converts an array's elements to all numerics.
+local function ConvertPathToNumeric(Path: GeneralStorePath)
     if (ConvertPathToNumericRegistry[Path]) then
         return
     end
 
-    for Index = 1, #Path do
-        local Value = Path[Index]
+    for Index, Value in Path do
         local AsNumber = tonumber(Value)
         Path[Index] = AsNumber or Value
 
@@ -90,322 +78,363 @@ local function ConvertPathToNumeric(Path: StorePath)
     ConvertPathToNumericRegistry[Path] = true
 end
 
+local function DeepCopyWithPathExceptions(Subject, Table, SendToPaths, CurrentPath)
+    local SendToValue = SendToPaths[CurrentPath]
+    if (SendToValue and not SendToValue[Subject]) then
+        print(">>>>>>>>>>>>>>Reject send to", CurrentPath)
+        return nil
+    end
+
+    local Result = table.clone(Table)
+    local Remove
+
+    for Key, Value in Table do
+        local KeyString = tostring(Key)
+        local NewPath = CurrentPath .. KeyString .. FlatPathDelimiter
+
+        if (type(Value) == "table") then
+            Value = DeepCopyWithPathExceptions(Subject, Value, SendToPaths, NewPath)
+        end
+
+        -- Need to remove the previous key if it was a number & convert to a string
+        -- to avoid mixed key type issues with RemoteEvent serialization.
+        if (type(Key) == "number") then
+            Remove = Remove or {}
+            table.insert(Remove, Key)
+        end
+
+        Result[KeyString] = Value
+    end
+
+    if (Remove) then
+        for _, Key in Remove do
+            Result[Key] = nil
+        end
+    end
+
+    return Result
+end
+
 -----------------------------------------------------------------------------------
 
-local ReplicatedStore = {}
-ReplicatedStore.__index = ReplicatedStore
-ReplicatedStore.Type = "ReplicatedStore"
+local function ReplicatedStore(RemoteEvent: RemoteEvent, IsServer: boolean, DeferFunction: ((Callback: (() -> ())) -> ())?)
+    assert(RemoteEvent, "No remote event given")
+    assert(IsServer ~= nil, "Please indicate whether this is running on server or client")
 
-function ReplicatedStore.new(RemoteEvent, IsServer: boolean)
-    assert(RemoteEvent, "No remote event given!")
-    assert(IsServer ~= nil, "Please indicate whether this is running on server or client!")
+    local self = {}
 
-    local self = {
-        _Store = GeneralStore.new();
-
-        _DeferredMerge = {};
-        _BlockedPlayers = {};
-
-        DeferFunction = function(Callback: () -> ())
-            -- Immediate defer by default, but easy to
-            -- switch to task.defer or some task.delay
-            -- fixed duration function
-            Callback()
-        end;
-
-        _Synced = false;
-        _IsServer = IsServer;
-        _Deferring = false;
-        _Initialized = false;
-
-        _RemoteEvent = RemoteEvent;
-
-        OnDefer = XSignal.new();
-    };
-
-    return setmetatable(self, ReplicatedStore)
-end
-
--- Client method; syncs the store
-function ReplicatedStore:InitClient()
-    assert(not self._Initialized, "Already initialized on client!")
-
-    local RemoteEvent = self._RemoteEvent
-    local StoreObject = self._Store
-
-    self._EventConnection = RemoteEvent.OnClientEvent:Connect(function(Data: RawStore?, InitialSync: boolean)
-        debug.profilebegin(REPLICATE_PROCESS_TAG)
-
-            --[[ if (Data == nil) then
-                StoreObject:Clear()
-                debug.profileend()
-                return
-            end ]]
-
-            Data = SerializeIncomingData(Data)
-
-            -- No need to merge data which comes in after we send off the initial sync request and wait for it to pass back
-            if (not InitialSync and not self._Synced) then
-                debug.profileend()
-                return
-            end
-
-            -- Initial sync will be up to date and the whole structure so we can stop rejecting after we receive it
-            if (InitialSync) then
-                self._Synced = true
-            end
-
-            -- Received events are in-order
-            StoreObject:Merge(Data)
-
-            if (InitialSync) then
-                task.spawn(function()
-                    if (RemoteEvent.Name == "Profile" and RemoteEvent.Parent == Players.LocalPlayer) then
-                        local StoreValue = StoreObject:Get({"DataLoaded"})
-
-                        if (Data.DataLoaded and StoreValue) then
-                            task.wait(5)
-
-                            if (not StoreObject:Get({"DataLoaded"})) then
-                                warn(`[ReplicatedStore] DataLoaded was overwritten`)
-                            end
-                        elseif (Data.DataLoaded and not StoreValue) then
-                            warn(`[ReplicatedStore] DataLoaded not registered in store`)
-                        else
-                            warn(`[ReplicatedStore] got Profile data but DataLoaded was not present`)
-                        end
-                    end
-                end)
-            end
-        debug.profileend()
-    end)
-
-    RemoteEvent:FireServer()
-    self._Initialized = true
-
-    task.spawn(function()
-        if (RemoteEvent.Name == "Profile" and RemoteEvent.Parent == Players.LocalPlayer) then
-            task.wait(15)
-
-            if (not self._Synced) then
-                warn(`[ReplicatedStore {RemoteEvent:GetFullName()}] failed to sync after 15 seconds / {tostring(RemoteEvent:GetAttribute("FS" .. tostring(Players.LocalPlayer.UserId):gsub("%-", "")))}`)
-            end
-        end
-    end)
-end
-
--- Server method; receives client requests
-function ReplicatedStore:InitServer()
-    assert(not self._Initialized, "Already initialized on server!")
-
-    local RemoteEvent = self._RemoteEvent
-
-    -- Client requests initial sync -> replicate whole state to client
-    self._EventConnection = RemoteEvent.OnServerEvent:Connect(function(Player: Player)
-        self:_FullSync(Player, true)
-    end)
-
-    self._Initialized = true
-end
-
-function ReplicatedStore:Destroy()
-    self._EventConnection:Disconnect()
-    self._Store:Destroy()
-end
-
--- Obtains down a path; does not error
-function ReplicatedStore:Get(Path: StorePath, DefaultValue: any?): any?
-    Path = Path or EMPTY_PATH
-    ConvertPathToNumeric(Path)
-    return self._Store:Get(Path, DefaultValue)
-end
-
--- Immediately update the internal Store object, but
--- create a defer point during which to merge changes
--- to the specific player(s) specified (or all by default)
-function ReplicatedStore:_ServerMerge(Data: RawStore, SendTo: {Player | string}?)
-    if (SendTo) then
-        -- Send only to specific players
-        for _, Player in SendTo do
-            self:DeferMerge(Player.Name, Data)
-        end
-    else
-        self:DeferMerge(DEFAULT_MERGE_CATEGORY, Data)
-    end
-end
-
-function ReplicatedStore:Merge(Data: RawStore, ...)
-    -- Keep our core store up to date
-    self._Store:Merge(Data)
-
-    -- Shaft off sending changes to clients to next defer function cycle (if server)
-    if (self._IsServer) then
-        self:_ServerMerge(Data, ...)
-    end
-end
-
-function ReplicatedStore:Set(Path: StorePath, Value: any?, SendTo: {Player | string}?)
-    assert(Path, ERR_NO_PATH_GIVEN)
-    assert(#Path > 0, ERR_ROOT_OVERWRITE)
-
-    Path = Path or EMPTY_PATH
-    ConvertPathToNumeric(Path)
-
-    if (type(Value) == TYPE_TABLE and self:Get(Path)) then
-        -- Set using table -> remove previous value and overwrite (we don't want to merge 'set' tables in - unintuitive)
-        self:Merge(BuildFromPath(Path, REMOVE_NODE), SendTo)
+    local _DeferFunction = DeferFunction or function(Callback: () -> ())
+        Callback()
     end
 
-    self:Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value), SendTo)
-end
+    local _GeneralStore = GeneralStore.new()
+        local _GSGetSubValueChangedSignal = _GeneralStore.GetSubValueChangedSignal
+        local _GSGetValueChangedSignal = _GeneralStore.GetValueChangedSignal
+        local _GSSetDebugLog = _GeneralStore.SetDebugLog
+        local _GSDestroy = _GeneralStore.Destroy
+        local _GSAwait = _GeneralStore.Await
+        local _GSMerge = _GeneralStore.Merge
+        local _GSGet = _GeneralStore.Get
+    local _GetPathString = GeneralStore._GetPathString
 
-function ReplicatedStore:DeferMerge(Category: string, Data: RawStore)
-    -- Insert into merge list for this category
-    local DeferredMerge = self._DeferredMerge
-    local MergeList = DeferredMerge[Category]
+    local _PlayerDisconnectConnection
+    local _EventConnection
+    local _ExclusiveSendTo = {}
+    local _BlockedPlayers = {}
+    local _DeferredMerge = {}
+    local _Initialized = false
+    local _Deferring = false
+    local _Destroyed = false
+    local _OnDefer = XSignal.new()
+    local _Synced = false
 
-    if (not MergeList) then
-        MergeList = table.create(MERGE_LIST_DEFAULT_SIZE)
-        DeferredMerge[Category] = MergeList
-    end
+    -- Client method to sync the store.
+    local function InitClient()
+        assert(not _Initialized, "Already initialized on client!")
 
-    table.insert(MergeList, Data)
+        _EventConnection = RemoteEvent.OnClientEvent:Connect(function(Data: GeneralStoreStructure, InitialSync: boolean)
+            debug.profilebegin(REPLICATE_PROCESS_TAG)
 
-    -- Activate next defer function
-    if (not self._Deferring) then
-        self._Deferring = true
+                --[[ if (Data == nil) then
+                    StoreObject:Clear()
+                    debug.profileend()
+                    return
+                end ]]
 
-        self.DeferFunction(function()
-            -- Since this may yield for a later frame, check if ReplicatedStore was Destroyed & reject defer if so
-            if (table.isfrozen(self)) then
-                return
-            end
+                Data = ConvertIncomingData(Data)
 
-            self._Deferring = false
-            self:DeferProcess()
+                -- No need to merge data which comes in after we send off the initial sync request and wait for it to pass back.
+                if (not InitialSync and not _Synced) then
+                    debug.profileend()
+                    return
+                end
+
+                -- Initial sync will be up to date and the whole structure so we can stop rejecting after we receive it.
+                if (InitialSync) then
+                    _Synced = true
+                end
+
+                _GSMerge(Data)
+            debug.profileend()
         end)
+
+        RemoteEvent:FireServer()
+        _Initialized = true
     end
-end
+    self.InitClient = InitClient
 
-function ReplicatedStore:DeferProcess()
-    local BlockedPlayers = self._BlockedPlayers
-    local DeferredMerge = self._DeferredMerge
-    local RemoteEvent = self._RemoteEvent
+    -- Obtains down a path; does not error
+    local function Get(Path: GeneralStorePath?, DefaultValue: any?): any?
+        Path = Path or EMPTY_PATH
+        ConvertPathToNumeric(Path :: any)
+        return _GSGet(Path, DefaultValue)
+    end
+    self.Get = Get
 
-    for PlayerName, Merges in DeferredMerge do
-        local Merged = {}
-
-        for Index = 1, #Merges do
-            InternalMerge(Merges[Index], Merged, true)
+    local function _FullSync(Player: Player, InitialSync: boolean)
+        local Result = DeepCopyWithPathExceptions(Player.Name, Get(), _ExclusiveSendTo, "")
+        if (not Result) then
+            return
         end
 
-        Merged = ConvertToStringIndices(Merged)
+        task.wait(0.2)
+        RemoteEvent:FireClient(Player, Result, InitialSync)
+        RemoteEvent:SetAttribute("FS" .. tostring(Player.UserId):gsub("%-", ""), true)
+    end
 
-        if (PlayerName == DEFAULT_MERGE_CATEGORY) then
-            -- Default merge category -> all players except ones in the block list
+    -- Server method; receives client requests.
+    local function InitServer()
+        assert(not _Initialized, "Already initialized on server!")
 
-            if (next(BlockedPlayers) == nil) then
-                -- No blocked players -> FireAllClients broadcast (more efficient)
-                RemoteEvent:FireAllClients(Merged, false)
-            else
-                for _, Player in Players:GetChildren() do
-                    if (BlockedPlayers[Player.Name]) then
-                        continue
-                    end
+        -- Client requests initial sync -> replicate whole state to client.
+        _EventConnection = RemoteEvent.OnServerEvent:Connect(function(Player: Player)
+            _FullSync(Player, true)
+        end)
 
-                    RemoteEvent:FireClient(Player, Merged, false)
+        -- Player disconnects -> remove from sync list.
+        _PlayerDisconnectConnection = Players.PlayerRemoving:Connect(function(Player)
+            local PlayerName = Player.Name
+            local Remove = {}
+
+            for Key, Value in _ExclusiveSendTo do
+                if (typeof(Value) ~= "table") then
+                    continue
+                end
+
+                Value[PlayerName] = nil
+
+                if (next(Value) == nil) then
+                    table.insert(Remove, Key)
                 end
             end
 
-            continue
+            for _, Key in Remove do
+                _ExclusiveSendTo[Key] = nil
+            end
+        end)
+
+        _Initialized = true
+    end
+    self.InitServer = InitServer
+
+    local function Destroy()
+        _Destroyed = true
+        _EventConnection:Disconnect()
+        if (_PlayerDisconnectConnection) then
+            _PlayerDisconnectConnection:Disconnect()
+        end
+        _GSDestroy()
+    end
+    self.Destroy = Destroy
+
+    local function _DeferProcess()
+        for PlayerName, Merges in _DeferredMerge do
+            local Merged = {}
+            for _, Value in Merges do
+                InternalMerge(Merged, Value, true)
+            end
+
+            if (next(Merged) == nil) then
+                continue
+            end
+
+            -- Default merge category -> all players except ones in the block list.
+            if (PlayerName == DEFAULT_MERGE_CATEGORY) then
+                for _, Player in Players:GetChildren() do
+                    local Name = Player.Name
+                    if (_BlockedPlayers[Name]) then
+                        continue
+                    end
+
+                    local Result = DeepCopyWithPathExceptions(Name, Merged, _ExclusiveSendTo, "")
+                    if (not Result) then
+                        continue
+                    end
+
+                    RemoteEvent:FireClient(Player, Result, false)
+                end
+
+                continue
+            end
+
+            -- Player-specific merge category -> a specific player.
+            local GotPlayer = Players:FindFirstChild(PlayerName)
+            if (not GotPlayer or _BlockedPlayers[PlayerName]) then
+                continue
+            end
+
+            local Result = DeepCopyWithPathExceptions(PlayerName, Merged, _ExclusiveSendTo, "")
+            if (not Result) then
+                continue
+            end
+
+            RemoteEvent:FireClient(GotPlayer, Result, false)
         end
 
-        -- Player-specific merge category -> a specific player
-        local GotPlayer = Players:FindFirstChild(PlayerName)
+        _DeferredMerge = {}
+        _OnDefer:Fire()
+    end
 
-        if (not GotPlayer or BlockedPlayers[PlayerName]) then
-            continue
+    local function _DeferMerge(Category: string, Data: GeneralStoreStructure)
+        -- Insert into merge list for this category.
+        local MergeList = _DeferredMerge[Category]
+        if (not MergeList) then
+            MergeList = table.create(MERGE_LIST_DEFAULT_SIZE)
+            _DeferredMerge[Category] = MergeList
+        end
+        table.insert(MergeList, Data)
+
+        -- Activate next defer function.
+        if (not _Deferring) then
+            _Deferring = true
+
+            _DeferFunction(function()
+                if (_Destroyed) then
+                    return
+                end
+
+                _Deferring = false
+                _DeferProcess()
+            end)
+        end
+    end
+
+    local function _ServerMerge(Data: GeneralStoreStructure, SendTo: SendTo?)
+        if (SendTo) then
+            -- Send only to specific players
+            for _, Player in SendTo do
+                _DeferMerge(Player.Name, Data)
+            end
+            return
         end
 
-        RemoteEvent:FireClient(GotPlayer, Merged, false)
+        _DeferMerge(DEFAULT_MERGE_CATEGORY, Data)
     end
 
-    self._DeferredMerge = {}
-    self.OnDefer:Fire()
-end
+    local function Merge(Data: GeneralStoreStructure, SendTo: SendTo?)
+        -- Keep our core store up to date.
+        _GSMerge(Data)
 
-function ReplicatedStore:GetValueChangedSignal(Path: StorePath): RBXScriptSignal
-    Path = Path or EMPTY_PATH
-    ConvertPathToNumeric(Path)
-    return self._Store:GetValueChangedSignal(Path)
-end
-
-function ReplicatedStore:GetSubValueChangedSignal(Path: StorePath): RBXScriptSignal
-    Path = Path or EMPTY_PATH
-    ConvertPathToNumeric(Path)
-    return self._Store:GetSubValueChangedSignal(Path)
-end
-
-function ReplicatedStore:Await(Path: StorePath, Timeout: number): any?
-    Path = Path or EMPTY_PATH
-    ConvertPathToNumeric(Path)
-    return self._Store:Await(Path, Timeout)
-end
-ReplicatedStore.await = ReplicatedStore.Await
-
-function ReplicatedStore:SetDebugLog(DebugLog: boolean)
-    self._Store:SetDebugLog(DebugLog)
-end
-
-ReplicatedStore.setDebugLog = ReplicatedStore.SetDebugLog
-
-function ReplicatedStore:_FullSync(Player: Player, InitialSync: boolean)
-    self._RemoteEvent:FireClient(Player, ConvertToStringIndices(self:Get()), InitialSync)
-    self._RemoteEvent:SetAttribute("FS" .. tostring(Player.UserId):gsub("%-", ""), true)
-end
-
-function ReplicatedStore:Block(Player: Player, Clear: boolean?)
-    error("Unimplemented")
-
-    local PlayerName = Player.Name
-    local BlockedPlayers = self._BlockedPlayers
-    assert(not BlockedPlayers[PlayerName])
-
-    -- We'll want to clean up the connection & connection ref if player leaves
-    local Connection; Connection = PlayerName.AncestryChanged:Connect(function(_, Parent)
-        if (Parent == nil) then
-            self:Unblock(Player, false)
+        -- Shaft off sending changes to clients to next defer function cycle (if server).
+        if (IsServer) then
+            _ServerMerge(Data, SendTo)
         end
-    end)
-
-    BlockedPlayers[PlayerName] = Connection
-
-    if (Clear) then
-        self._RemoteEvent:FireClient(Player)
     end
+    self.Merge = Merge
+
+    local function Set(Path: GeneralStorePath, Value: any?, SendTo: SendTo?)
+        assert(Path, ERR_NO_PATH_GIVEN)
+        assert(#Path > 0, ERR_ROOT_OVERWRITE)
+
+        Path = Path or EMPTY_PATH
+        ConvertPathToNumeric(Path)
+
+        if (type(Value) == "table" and Get(Path)) then
+            -- Set using table -> remove previous value and overwrite (we don't want to merge 'set' tables in - unintuitive)
+            Merge(BuildFromPath(Path, RemoveNode), SendTo)
+        end
+
+        Merge(BuildFromPath(Path, Value == nil and RemoveNode or Value), SendTo)
+    end
+    self.Set = Set
+
+    local function GetValueChangedSignal(Path: GeneralStorePath): RBXScriptSignal
+        Path = Path or EMPTY_PATH
+        ConvertPathToNumeric(Path)
+        return _GSGetValueChangedSignal(Path)
+    end
+    self.GetValueChangedSignal = GetValueChangedSignal
+
+    local function GetSubValueChangedSignal(Path: GeneralStorePath): RBXScriptSignal
+        Path = Path or EMPTY_PATH
+        ConvertPathToNumeric(Path)
+        return _GSGetSubValueChangedSignal(Path)
+    end
+    self.GetSubValueChangedSignal = GetSubValueChangedSignal
+
+    local function Await(Path: GeneralStorePath, Timeout: number): any?
+        Path = Path or EMPTY_PATH
+        ConvertPathToNumeric(Path)
+        return _GSAwait(Path, Timeout)
+    end
+    self.Await = Await
+
+    local function SetDebugLog(DebugLog: boolean)
+        _GSSetDebugLog(DebugLog)
+    end
+    self.SetDebugLog = SetDebugLog
+
+    local function ExclusiveSync(Path: GeneralStorePath, Players: {Player}?)
+        assert(Path, "No path given")
+        ConvertPathToNumeric(Path)
+        _ExclusiveSendTo[_GetPathString(Path)] = (Players and Map(Players, function(Player)
+            return true, Player.Name
+        end) or nil)
+    end
+    self.ExclusiveSync = ExclusiveSync
+
+    --[[ local function Block(Player: Player, Clear: boolean?)
+        error("Unimplemented")
+
+        local PlayerName = Player.Name
+        local BlockedPlayers = _BlockedPlayers
+        assert(not BlockedPlayers[PlayerName])
+
+        local Connection; Connection = Player.AncestryChanged:Connect(function(_, Parent)
+            if (Parent == nil) then
+                Unblock(Player, false)
+            end
+        end)
+
+        BlockedPlayers[PlayerName] = Connection
+
+        if (Clear) then
+            _RemoteEvent:FireClient(Player)
+        end
+    end
+
+    local function Unblock(Player: Player, Renew: boolean?)
+        error("Unimplemented")
+
+        local PlayerName = Player.Name
+        local BlockedPlayers = _BlockedPlayers
+        local Connection = BlockedPlayers[PlayerName]
+
+        if (not Connection) then
+            return
+        end
+
+        Connection:Disconnect()
+        BlockedPlayers[PlayerName] = nil
+
+        if (Renew) then
+            _FullSync(Player, false)
+        end
+    end ]]
+
+    return self
 end
 
-function ReplicatedStore:Unblock(Player: Player, Renew: boolean?)
-    error("Unimplemented")
-
-    local PlayerName = Player.Name
-    local BlockedPlayers = self._BlockedPlayers
-    local Connection = BlockedPlayers[PlayerName]
-
-    if (not Connection) then
-        return
-    end
-
-    Connection:Disconnect()
-    BlockedPlayers[PlayerName] = nil
-
-    if (Renew) then
-        self:_FullSync(Player, false)
-    end
-end
-
-Cleaner.Wrap(ReplicatedStore)
-
-export type ReplicatedStore = typeof(ReplicatedStore)
-
-return ReplicatedStore
+return table.freeze({
+    new = ReplicatedStore;
+})

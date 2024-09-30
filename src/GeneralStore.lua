@@ -1,26 +1,23 @@
+--!native
+--!optimize 2
 --!nonstrict
 
 -- Allows easy command bar paste.
 if (not script) then
-	script = game:GetService("ReplicatedFirst").Vapor.GeneralStore
+    script = game:GetService("ReplicatedFirst").Vapor.GeneralStore
 end
 
-local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
-local XSignal = require(script.Parent.Parent:WaitForChild("XSignal"))
+local XSignal = require(script.Parent.Parent.XSignal)
 
--- More strings
+export type GeneralStoreKey = string | number
+export type GeneralStoreStructure = {[GeneralStoreKey]: any}
+export type GeneralStorePath = {GeneralStoreKey}
+
 local FLAT_PATH_DELIMITER = "^"
+local DEFAULT_TIMEOUT = 240
+local TIMEOUT_WARN = 5
 local EMPTY_STRING = ""
 
--- Types
-export type StoreKey = string | number
-export type RawStore = {[StoreKey]: any}
-export type StorePath = {StoreKey}
-
-local TYPE_STRING = "string"
-local TYPE_TABLE = "table"
-
--- Logs, warnings & errors
 local NAME_PREFIX = "[GeneralStore] "
 
 local LOG_UP_PROPAGATE = NAME_PREFIX .. "Up-propagate %s"
@@ -34,30 +31,22 @@ local ERR_STORE_TIMEOUT_REACHED = NAME_PREFIX .. "Store timeout reached! Path: %
 local ERR_AWAIT_PATH_NOT_STRING = NAME_PREFIX .. "AwaitingPath not a string!"
 local ERR_AWAIT_PATH_NOT_GIVEN = NAME_PREFIX .. "AwaitingPath not given!"
 local ERR_MERGE_ATOM_ATTEMPT = NAME_PREFIX .. "Cannot merge an atom into the store!"
-local ERR_NO_EXISTING_AWAIT = NAME_PREFIX .. "No existing await event for: %s"
 local ERR_NO_ITEMS_IN_PATH = NAME_PREFIX .. "No items in path (no ascendants derivable)"
 local ERR_ROOT_OVERWRITE = NAME_PREFIX .. "Attempt to set root table (path empty)"
 local ERR_NO_VALUE_GIVEN = NAME_PREFIX .. "No value given!"
 local ERR_NO_PATH_GIVEN = NAME_PREFIX .. "No path given!"
-local ERR_MIXED_KEYS = NAME_PREFIX .. "Attempted to insert using mixed keys!"
 
--- Don't change
+-- Don't change...
 local REMOVE_NODE = {REMOVE_NODE = true}
 local EMPTY_PATH = {}
-
--- Settings
-local DEFAULT_TIMEOUT = 120 -- Await timeout, prevents memory leaks
-local TIMEOUT_WARN = 5 -- When to warn user in possible timeout case
+local WEAK_MT = {__mode = "v"}
 
 -----------------------------------------------------------------------------------
-
--- Traverses each item in the table recursively, creating a path string for each
--- Not inclusive of root
-local function PathTraverse(Root: RawStore, Path: string, Callback: (string, any, string, string) -> ())
+local function PathTraverse(Root: GeneralStoreStructure, Path: string, Callback: (string, any, string, string) -> ())
     for Key, Value in Root do
         local NewPath = Path .. tostring(Key) .. FLAT_PATH_DELIMITER
 
-        if (type(Value) == TYPE_TABLE) then
+        if (type(Value) == "table") then
             PathTraverse(Value, NewPath, Callback)
         end
 
@@ -65,38 +54,33 @@ local function PathTraverse(Root: RawStore, Path: string, Callback: (string, any
     end
 end
 
-local function GetPathString(Path: StorePath): string
-    local Length = #Path
+local function GetPathString(Path: GeneralStorePath): string
     local Result = EMPTY_STRING
-
-    for Index = 1, Length do
-        Result ..= tostring(Path[Index]) .. FLAT_PATH_DELIMITER
+    for _, Value in Path do
+        Result ..= tostring(Value) .. FLAT_PATH_DELIMITER
     end
-
     return Result
 end
 
-local function InternalMerge(Data, Into, BypassRemoveNode)
+local function InternalMerge(Into, Data)
     for Key, Value in Data do
-        if ((not BypassRemoveNode) and Value == REMOVE_NODE) then
-            Into[Key] = nil
+        if (Value == REMOVE_NODE) then
+            Into[Key] = REMOVE_NODE
             continue
         end
 
-        if (typeof(Value) == "table") then
-            local Got = Into[Key]
+        if (type(Value) == "table") then
+            local Existing = Into[Key]
 
-            if (Got == nil) then
-                Got = {}
-                Into[Key] = Got
+            if (Existing == REMOVE_NODE) then
+                Existing = table.clone(REMOVE_NODE)
+                Into[Key] = Existing
+            elseif (not Existing) then
+                Existing = {}
+                Into[Key] = Existing
             end
 
-            if (typeof(Got) ~= "table" and Value == REMOVE_NODE) then
-                Into[Key] = REMOVE_NODE
-                continue
-            end
-
-            InternalMerge(Value, Got, BypassRemoveNode)
+            InternalMerge(Existing, Value)
             continue
         end
 
@@ -104,7 +88,7 @@ local function InternalMerge(Data, Into, BypassRemoveNode)
     end
 end
 
-local function BuildFromPath(Path: StorePath, Value: any): RawStore
+local function BuildFromPath(Path: GeneralStorePath, Value: any): GeneralStoreStructure
     assert(Path, ERR_NO_PATH_GIVEN)
     assert(Value ~= nil, ERR_NO_VALUE_GIVEN)
 
@@ -122,393 +106,376 @@ local function BuildFromPath(Path: StorePath, Value: any): RawStore
     end
 
     Last[Path[Length]] = Value
-
     return Built
 end
 
 -----------------------------------------------------------------------------------
 
-local Store = {}
-Store.__index = Store
-Store.Type = "Store"
+local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: any?)
+    local DeferFunction = Defer
+    local self = {}
+    
+    local _ShaftedEvents = {} -- ShaftedEvents: {[string]: Signal}
+    local _Structure = {}
+    local _Deferring = false
+    local _Destroyed = false
+    local _DebugLog = false
+    local _Awaiting = setmetatable({}, WEAK_MT) -- Awaiting: {[PathString]: Signal}
 
-function Store.new(DeferFunction, DefaultStructure: any?)
-    local StoreStructure = {}; -- The data to be replicated
+    --- Destroys the store, firing nil to all sub-values & disconnecting all events.
+    local function Destroy()
+        -- Todo: use Clear()
+        _Destroyed = true
 
-    local self = {
-        _Store = StoreStructure;
-
-        _Awaiting = setmetatable({}, {__mode = "k"}); -- Awaiting: {[PathString]: Signal}
-        _DeferredEvents = {}; -- DeferredEvents: {[string]: Signal}
-
-        _DebugLog = false;
-        _Deferring = false;
-
-        DeferFunction = DeferFunction;
-    };
-
-    local Object = setmetatable(self, Store)
-
-    if (DefaultStructure) then
-        -- Not possible to hook into changed events using this,
-        -- since it occurs in construction
-        Object:Merge(DefaultStructure)
+        for _, Event in _Awaiting do
+            Event:Fire(nil)
+            Event:Destroy()
+        end
     end
+    self.Destroy = Destroy
 
-    return Object
-end
+    --- Queues up changes in the store which will only fire to value
+    --- changed signals at a later point with the latest values.
+    local function _DeferEventFlat(PathString: string, New: any?, Old: any?, Key: string?, ParentPathName: string?)
+        if (not _Awaiting[PathString]) then
+            return
+        end
 
-function Store:Destroy()
-    for _, Event in self._Awaiting do
-        Event:Fire(nil) -- Release all awaiting
-        Event:Destroy()
-    end
-end
+        local ShaftedEvents = _ShaftedEvents
+        ShaftedEvents[PathString] = {New, Old, Key, ParentPathName}
 
---[[
-    Obtains down a path, and does not error for nil values.
-]]
-function Store:Get(Path: StorePath, DefaultValue: any?): any?
-    Path = Path or EMPTY_PATH
+        if (not _Deferring) then
+            _Deferring = true
 
-    local Result = self._Store
+            DeferFunction(function()
+                if (_Destroyed) then
+                    return
+                end
 
-    for Index = 1, #Path do
-        Result = Result[Path[Index]]
+                _ShaftedEvents = {}
+                _Deferring = false
 
-        if (Result == nil) then
-            return DefaultValue
+                for PathName, Change in ShaftedEvents do
+                    local Event = _Awaiting[PathName]
+                    if (Event) then
+                        local Value, Old = Change[1], Change[2]
+                        Event:Fire(Value, Old, Value == Old)
+                    end
+
+                    local ParentPathName = Change[4]
+                    if (ParentPathName) then
+                        local ParentEvent = _Awaiting[ParentPathName .. "\255"]
+                        if (ParentEvent) then
+                            ParentEvent:Fire(Change[3], Change[1], Change[2])
+                        end
+                    end
+                end
+            end)
         end
     end
 
-    return Result
-end
-Store.get = Store.Get
-
---[[
-    Sets down a path; constructs tables if none are present along the way.
-]]
-function Store:Set(Path: StorePath, Value: any?)
-    assert(Path, ERR_NO_PATH_GIVEN)
-    assert(#Path > 0, ERR_ROOT_OVERWRITE)
-
-    if (type(Value) == TYPE_TABLE and self:Get(Path)) then
-        -- Set using table -> remove previous value and overwrite (we don't want to merge 'set' tables in - unintuitive)
-        self:Merge(BuildFromPath(Path, REMOVE_NODE))
-    end
-
-    self:Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value))
-end
-Store.set = Store.Set
-
---[[
-    Same as Set except merges with existing tables instead
-    of overwriting them.
-]]
-function Store:SetMerge(Path: StorePath, Value: any?)
-    assert(Path, ERR_NO_PATH_GIVEN)
-    assert(#Path > 0, ERR_ROOT_OVERWRITE)
-
-    self:Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value))
-end
-Store.setMerge = Store.SetMerge
-
---[[
-    Merges a data structure into the existing structure.
-    The core mechanism for changing the store.
-]]
-function Store:Merge(Data: RawStore)
-    assert(type(Data) == TYPE_TABLE, ERR_MERGE_ATOM_ATTEMPT)
-
-    local StoreData = self._Store
-    self:_Merge(EMPTY_STRING, Data, StoreData)
-    self:_PathWasChanged(EMPTY_STRING, StoreData, StoreData, nil, nil)
-end
-Store.merge = Store.Merge
-
---[[
-    Clears the whole store.
-]]
-function Store:Clear()
-    for Key in self:Get() do
-        self:Merge({[Key] = REMOVE_NODE})
-    end
-end
-Store.clear = Store.Clear
-
--- Waits for a value
-function Store:Await(Path: StorePath, Timeout: number?): any
-    local CorrectedTimeout = Timeout or DEFAULT_TIMEOUT
-    local Got = self:Get(Path)
-
-    -- ~= nil as it could be false
-    if (Got ~= nil) then
-        return Got
-    end
-
-    local Trace = debug.traceback()
-
-    -- Proxy for timeout OR the awaiting event, as we don't want to fire the awaiting event on timeout incase other coroutines are listening
-    local StringPath = GetPathString(Path or EMPTY_PATH)
-    local ValueSignal = self:_GetValueChangedSignalFlat(StringPath)
-
-    local Warning = task.delay(TIMEOUT_WARN, function()
-        warn(WARN_INFINITE_WAIT:format(StringPath, Trace))
-    end)
-
-    local Result = ValueSignal:Wait(CorrectedTimeout)
-    task.cancel(Warning)
-
-    -- It timed out
-    if (Result == nil) then
-        error(ERR_STORE_TIMEOUT_REACHED:format(StringPath, CorrectedTimeout))
-    end
-
-    return Result
-end
-Store.await = Store.Await
-
--- _GetValueChangedSignalFlat except takes a StorePath
-function Store:GetValueChangedSignal(Path: StorePath): RBXScriptSignal
-    return self:_GetValueChangedSignalFlat(GetPathString(Path))
-end
-Store.getValueChangedSignal = Store.GetValueChangedSignal
-
-function Store:GetSubValueChangedSignal(Path: StorePath): RBXScriptSignal
-    return self:_GetValueChangedSignalFlat(GetPathString(Path) .. "\255")
-end
-
---[[
-    Defers value changed events for paths to the next
-    defer point. Useful for not rapidly updating non
-    leaf nodes for many changes on those leaf nodes
-    before a conceptual defer point (like beginning of
-    Heartbeat). E.g. updating a Store 10 times in a frame
-    and using a frame-long wait as defer point would only
-    fire the root event once. Useful for UI performance or
-    general state update hook performance.
-]]
-function Store:_DeferEventFlat(PathString: string, New: any?, Old: any?, Key: string, ParentPathName: string?)
-    local Awaiting = self._Awaiting
-
-    if (not Awaiting[PathString]) then
-        return
-    end
-
-    local DeferredEvents = self._DeferredEvents -- TODO: order it
-    DeferredEvents[PathString] = {New, Old, Key, ParentPathName}
-
-    if (not self._Deferring) then
-        self._Deferring = true
-
-        self.DeferFunction(function()
-            if (table.isfrozen(self)) then
-                return
+    --- Fires a signal when an atom or table was changed in a merge
+    local function _PathWasChanged(PathName: string, Value: any?, Old: any?, Key: string?, ParentPathName: string?)
+        if (DeferFunction) then
+            _DeferEventFlat(PathName, Value, Old, Key, ParentPathName)
+        else
+            local Event = _Awaiting[PathName]
+            if (Event) then
+                Event:Fire(Value, Old, Value == Old)
             end
 
-            self._DeferredEvents = {}
-            self._Deferring = false
+            if (ParentPathName) then
+                local ParentEvent = _Awaiting[ParentPathName .. "\255"]
+                if (ParentEvent) then
+                    ParentEvent:Fire(Key, Value, Old)
+                end
+            end
+        end
 
-            for PathName, Change in DeferredEvents do
-                local Event = Awaiting[PathName]
+        if (_DebugLog) then
+            PathName = (PathName == "" and "ROOT" or PathName)
 
-                if (Event) then
-                    local Value, Old = Change[1], Change[2]
-                    Event:Fire(Value, Old, Value == Old)
+            if (Old ~= nil and Value ~= nil) then
+                if (Old == Value) then
+                    --> Up-propagated
+                    print(LOG_UP_PROPAGATE:format(PathName))
+                else
+                    --> Changed
+                    print(LOG_CHANGE:format(PathName, tostring(Old), tostring(Value)))
+                end
+            elseif (Old == nil and Value ~= nil) then
+                --> Creation
+                print(LOG_CREATE:format(PathName, tostring(Value)))
+            elseif (Old ~= nil and Value == nil) then
+                --> Destruction
+                print(LOG_DESTROY:format(PathName, tostring(Value)))
+            end
+        end
+    end
+
+    --- Obtains down a path, and does not error for nil values.
+    local function Get(Path: GeneralStorePath, DefaultValue: any?): any?
+        Path = Path or EMPTY_PATH
+
+        local Result = _Structure
+        for _, Key in Path do
+            Result = Result[Key]
+            if (Result == nil) then
+                return DefaultValue
+            end
+        end
+        return Result
+    end
+    self.Get = Get
+
+    local function _Merge(ParentPath, Data, Into)
+        local ExistingKey = next(Into)
+        local DidChange = false
+        local LastType
+
+        if (ExistingKey) then
+            LastType = typeof(ExistingKey)
+        end
+
+        for Key, Value in Data do
+            local ValuePath = ParentPath .. tostring(Key) .. FLAT_PATH_DELIMITER
+            local ExistingValue = Into[Key]
+
+            local KeyType = typeof(Key)
+            local ExistingValueType = typeof(ExistingValue)
+
+            if (not LastType) then
+                LastType = KeyType
+            end
+
+            -- Mixed key types bad bad bad bad bad.
+            if (KeyType ~= LastType) then
+                error(`{NAME_PREFIX}Attempted to insert using mixed keys! ({ValuePath}: {LastType} + {KeyType})`)
+            end
+
+            if (Value == ExistingValue) then
+                -- No change, so no need to fire off any events (which would otherwise happen).
+                continue
+            end
+
+            local ValueIsTable = (type(Value) == "table")
+            if (ValueIsTable and Value.REMOVE_NODE) then
+                -- REMOVE_NODE is used in place of 'nil' in tables (since obviously
+                -- nil-ed values won't exist, so this acts as a signifier to remove)
+
+                if (ExistingValue == nil) then
+                    continue
                 end
 
-                local ParentPathName = Change[4]
+                -- If REMOVE_NODE table has 2 keys then it must have been removed then merged.
+                -- Semantically this is requires remove table, then merge table, so skip "continue".
+                local AllowContinue = (next(Value, (next(Value)))) == nil
+                local Skip = false
+                DidChange = true
 
-                if (ParentPathName) then
-                    local ParentEvent = Awaiting[ParentPathName .. "\255"]
-        
-                    if (ParentEvent) then
-                        ParentEvent:Fire(Change[3], Change[1], Change[2])
+                if (ExistingValueType == "table") then
+                    -- "Remove table" -> all awaiting events on sub-paths should be fired
+                    Into[Key] = nil
+
+                    PathTraverse(ExistingValue, ValuePath, function(NewPath, OldValue, Key, ParentPath)
+                        _PathWasChanged(NewPath, nil, OldValue, Key, ParentPath)
+                    end)
+                    _PathWasChanged(ValuePath, nil, ExistingValue, Key, ParentPath)
+
+                    if (AllowContinue) then
+                        continue
+                    end
+
+                    ExistingValue = nil
+                    Skip = true
+                end
+
+                -- "Remove atom" -> nullify, then signify path was changed to nil
+                if (not Skip) then
+                    Into[Key] = nil
+                    _PathWasChanged(ValuePath, nil, ExistingValue, Key, ParentPath)
+                    ExistingValue = nil
+
+                    if (AllowContinue) then
+                        continue
                     end
                 end
             end
-        end)
+
+            if (ValueIsTable) then
+                if (Value.REMOVE_NODE) then
+                    Value.REMOVE_NODE = nil
+                end
+
+                -- Item is a sub-table -> recurse and then activate changed event (up-propagated)
+                local IsNew = (ExistingValue == nil)
+
+                if (IsNew) then
+                    DidChange = true
+                    ExistingValue = {}
+                    Into[Key] = ExistingValue
+                end
+
+                local Temp = _Merge(ValuePath, Value, ExistingValue)
+                DidChange = DidChange or Temp
+
+                if (IsNew) then
+                    _PathWasChanged(ValuePath, ExistingValue, nil, Key, ParentPath)
+                elseif (DidChange) then
+                    _PathWasChanged(ValuePath, ExistingValue, ExistingValue, Key, ParentPath)
+                end
+
+                continue
+            end
+
+            if (ExistingValueType == "table") then
+                -- Replacing a table -> fire all sub-paths with nil
+                PathTraverse(ExistingValue, ValuePath, function(NewPath, OldValue, Key, ParentPath)
+                    _PathWasChanged(NewPath, nil, OldValue, Key, ParentPath)
+                end)
+            end
+
+            -- Existing value is nil or not equal to new value -> put in new value
+            Into[Key] = Value
+            _PathWasChanged(ValuePath, Value, ExistingValue, Key, ParentPath)
+            DidChange = true
+        end
+
+        return DidChange
     end
-end
 
--- Creates or obtains the event corresponding to a path's value changing
-function Store:_GetValueChangedSignalFlat(AwaitingPath: string, SubValue: boolean?)
-    assert(AwaitingPath, ERR_AWAIT_PATH_NOT_GIVEN)
-    assert(type(AwaitingPath) == TYPE_STRING, ERR_AWAIT_PATH_NOT_STRING)
+    --- Merges data into the existing structure.
+    --- The core mechanism for changing the store.
+    local function Merge(Data: GeneralStoreStructure)
+        assert(type(Data) == "table", ERR_MERGE_ATOM_ATTEMPT)
+        _Merge(EMPTY_STRING, Data, _Structure)
+        _PathWasChanged(EMPTY_STRING, _Structure, _Structure, nil, nil)
+    end
+    self.Merge = Merge
 
-    -- TODO: move these into Connect?
-    local Awaiting = self._Awaiting
-        local Event = Awaiting[AwaitingPath]
+    --- Sets down a path, constructing tables if none are present along the way.
+    local function Set(Path: GeneralStorePath, Value: any?)
+        assert(Path, ERR_NO_PATH_GIVEN)
+        assert(#Path > 0, ERR_ROOT_OVERWRITE)
 
-    if (Event) then
+        if (type(Value) == "table" and Get(Path)) then
+            -- Set using table -> remove previous value and overwrite (we don't want to merge 'set' tables in - unintuitive)
+            Merge(BuildFromPath(Path, REMOVE_NODE))
+        end
+
+        Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value))
+    end
+    self.Set = Set
+
+    --- Same as Set except merges with existing tables instead
+    --- of overwriting them.
+    local function SetMerge(Path: GeneralStorePath, Value: any?)
+        assert(Path, ERR_NO_PATH_GIVEN)
+        assert(#Path > 0, ERR_ROOT_OVERWRITE)
+        Merge(BuildFromPath(Path, Value == nil and REMOVE_NODE or Value))
+    end
+    self.SetMerge = SetMerge
+
+    --- Clears the whole store.
+    local function Clear()
+        for Key in assert(Get({})) do
+            Merge({[Key] = REMOVE_NODE})
+        end
+    end
+    self.Clear = Clear
+
+    --- Creates or obtains the event corresponding to a path's value changing.
+    local function _GetValueChangedSignalFlat(AwaitingPath: string, SubValue: boolean?)
+        assert(AwaitingPath, ERR_AWAIT_PATH_NOT_GIVEN)
+        assert(type(AwaitingPath) == "string", ERR_AWAIT_PATH_NOT_STRING)
+
+        local Event = _Awaiting[AwaitingPath]
+        if (Event) then
+            return Event
+        end
+
+        Event = XSignal.new()
+        _Awaiting[AwaitingPath] = Event
         return Event
     end
 
-    Event = XSignal.new()
-    Awaiting[AwaitingPath] = Event
-    return Event
+    --- Creates or obtains the event corresponding to a path's value changing.
+    local function GetValueChangedSignal(Path: GeneralStorePath): RBXScriptSignal
+        return _GetValueChangedSignalFlat(GetPathString(Path))
+    end
+    self.GetValueChangedSignal = GetValueChangedSignal
+
+    --- Creates or obtains the event corresponding to a path's sub key-value pairs changing.
+    local function GetSubValueChangedSignal(Path: GeneralStorePath): RBXScriptSignal
+        return _GetValueChangedSignalFlat(GetPathString(Path) .. "\255")
+    end
+    self.GetSubValueChangedSignal = GetSubValueChangedSignal
+
+    -- Waits for a value down a path.
+    local function Await(Path: GeneralStorePath, Timeout: number?): any
+        local CorrectedTimeout = Timeout or DEFAULT_TIMEOUT
+        local Got = Get(Path)
+
+        -- ~= nil as it could be false.
+        if (Got ~= nil) then
+            return Got
+        end
+
+        local Trace = debug.traceback()
+
+        -- Proxy for timeout OR the awaiting event, as we don't want to fire the awaiting event on timeout incase other coroutines are listening.
+        local StringPath = GetPathString(Path or EMPTY_PATH)
+        local ValueSignal = _GetValueChangedSignalFlat(StringPath)
+
+        local Warning = task.delay(TIMEOUT_WARN, function()
+            warn(WARN_INFINITE_WAIT:format(StringPath, Trace))
+        end)
+
+        local Result = ValueSignal:Wait(CorrectedTimeout)
+        task.cancel(Warning)
+
+        -- It timed out
+        if (Result == nil) then
+            error(ERR_STORE_TIMEOUT_REACHED:format(StringPath, CorrectedTimeout))
+        end
+
+        return Result
+    end
+    self.Await = Await
+
+    --- Turns debug logging on or off (printing out all path value changes).
+    local function SetDebugLog(DebugLog: boolean)
+        _DebugLog = DebugLog
+    end
+    self.SetDebugLog = SetDebugLog
+
+    --- Obtains or creates metadata for a path.
+    --- Todo.
+    --[[ local function GetMetadata(Path: GeneralStorePath): any
+        Path = Path or EMPTY_PATH
+        local PathString = GetPathString(Path)
+        local Target = _Metadata[PathString]
+        if (Target) then
+            return Target
+        end
+        Target = {}
+        _Metadata[PathString] = Target
+        return Target
+    end
+    self.GetMetadata = GetMetadata ]]
+
+    if (DefaultStructure) then
+        Merge(DefaultStructure)
+    end
+    return self
 end
-
--- Fires a signal when an atom or table was changed in a merge
-function Store:_PathWasChanged(PathName: string, Value: any?, Old: any?, Key: string, ParentPathName: string?)
-    if (self.DeferFunction) then
-        self:_DeferEventFlat(PathName, Value, Old, Key, ParentPathName)
-    else
-        local Awaiting = self._Awaiting
-            local Event = Awaiting[PathName]
-
-        if (Event) then
-            Event:Fire(Value, Old, Value == Old)
-        end
-
-        if (ParentPathName) then
-            local ParentEvent = Awaiting[ParentPathName .. "\255"]
-
-            if (ParentEvent) then
-                ParentEvent:Fire(Key, Value, Old)
-            end
-        end
-    end
-
-    if (self._DebugLog) then
-        PathName = (PathName == "" and "ROOT" or PathName)
-
-        if (Old ~= nil and Value ~= nil) then
-            if (Old == Value) then
-                --> Up-propagated
-                print(LOG_UP_PROPAGATE:format(PathName))
-            else
-                --> Changed
-                print(LOG_CHANGE:format(PathName, tostring(Old), tostring(Value)))
-            end
-        elseif (Old == nil and Value ~= nil) then
-            --> Creation
-            print(LOG_CREATE:format(PathName, tostring(Value)))
-        elseif (Old ~= nil and Value == nil) then
-            --> Destruction
-            print(LOG_DESTROY:format(PathName, tostring(Value)))
-        end
-    end
-end
-
--- Separate merge procedure since recursion is necessary and params would be inconvenient to the user
-function Store:_Merge(ParentPath, Data, Into)
-    local ExistingKey = next(Into)
-    local LastType
-
-    if (ExistingKey) then
-        LastType = type(ExistingKey)
-    end
-
-    for Key, Value in Data do
-        local ValuePath = ParentPath .. tostring(Key) .. FLAT_PATH_DELIMITER
-        local ExistingValue = Into[Key]
-
-        local KeyType = typeof(Key)
-        local ExistingValueType = type(ExistingValue)
-
-        if (not LastType) then
-            LastType = KeyType
-        end
-
-        -- Mixed key types bad bad bad bad bad
-        assert(KeyType == LastType, ERR_MIXED_KEYS)
-
-        if (Value == ExistingValue) then
-            -- No change, so no need to fire off any events (which would otherwise happen)
-            continue
-        end
-
-        if (Value == REMOVE_NODE) then
-            -- REMOVE_NODE is used in place of 'nil' in tables (since obviously
-            -- nil-ed values won't exist, so this acts as a signifier to remove)
-
-            if (ExistingValue == nil) then
-                continue
-            end
-
-            if (ExistingValueType == TYPE_TABLE) then
-                -- "Remove table" -> all awaiting events on sub-paths should be fired
-                Into[Key] = nil
-
-                PathTraverse(ExistingValue, ValuePath, function(NewPath, OldValue, Key, ParentPath)
-                    self:_PathWasChanged(NewPath, nil, OldValue, Key, ParentPath)
-                end)
-
-                self:_PathWasChanged(ValuePath, nil, ExistingValue, Key, ParentPath)
-                continue
-            end
-
-            -- "Remove atom" -> nullify, then signify path was changed to nil
-            Into[Key] = nil
-            self:_PathWasChanged(ValuePath, nil, ExistingValue, Key, ParentPath)
-            continue
-        end
-
-        if (type(Value) == TYPE_TABLE) then
-            -- Item is a sub-table -> recurse and then activate changed event (up-propagated)
-            local IsNew = (ExistingValue == nil)
-
-            if (IsNew) then
-                ExistingValue = {}
-                Into[Key] = ExistingValue
-            end
-
-            self:_Merge(ValuePath, Value, ExistingValue)
-
-            if (IsNew) then
-                self:_PathWasChanged(ValuePath, ExistingValue, nil, Key, ParentPath)
-            else
-                self:_PathWasChanged(ValuePath, ExistingValue, ExistingValue, Key, ParentPath)
-            end
-
-            continue
-        end
-
-        if (ExistingValueType == TYPE_TABLE) then
-            -- Replacing a table -> fire all sub-paths with nil
-            PathTraverse(ExistingValue, ValuePath, function(NewPath, OldValue, Key, ParentPath)
-                self:_PathWasChanged(NewPath, nil, OldValue, Key, ParentPath)
-            end)
-        end
-
-        -- Existing value is nil or not equal to new value -> put in new value
-        Into[Key] = Value
-        self:_PathWasChanged(ValuePath, Value, ExistingValue, Key, ParentPath)
-    end
-end
-
--- Turns debug logging on or off
-function Store:SetDebugLog(DebugLog: boolean)
-    self._DebugLog = DebugLog
-end
-
-Store._REMOVE_NODE = REMOVE_NODE
-Store._PathTraverse = PathTraverse
-Store._InternalMerge = InternalMerge
-Store._GetPathString = GetPathString
-Store._BuildFromPath = BuildFromPath
-
--- For testing
-    function Store:_GetAwaitingCount(Path: StorePath): number
-        return self._AwaitingRefs[GetPathString(Path)]
-    end
-
-    function Store:_RawGetValueChangedSignal(Path: StorePath): RBXScriptSignal
-        return self._Awaiting[GetPathString(Path)]
-    end
---
-
-Cleaner.Wrap(Store)
-
-export type Store = typeof(Store)
 
 --[[
     -- Example usage
-
-    local Test = Store.new()
-    Test:SetDebugLog(true)
-    Test:Merge({
+    local Test = Store()
+    Test.SetDebugLog(true)
+    Test.GetValueChangedSignal({}):Connect(function(...) print("AHHHH", ...) end)
+    Test.Merge({
         A = {
             B = {
                 C = 5;
@@ -519,7 +486,7 @@ export type Store = typeof(Store)
 
     print("---")
 
-    Test:Merge({
+    Test.Merge({
         A = {
             B = {
                 C = 10;
@@ -530,7 +497,7 @@ export type Store = typeof(Store)
 
     print("---")
 
-    Test:Merge({
+    Test.Merge({
         A = {
             D = 2
         }
@@ -538,9 +505,18 @@ export type Store = typeof(Store)
 
     print("---")
 
-    Test:Merge({
+    Test.Merge({
         A = REMOVE_NODE;
     })
 ]]
 
-return Store
+return table.freeze({
+    _FlatPathDelimiter = FLAT_PATH_DELIMITER;
+    _BuildFromPath = BuildFromPath;
+    _GetPathString = GetPathString;
+    _InternalMerge = InternalMerge;
+    _PathTraverse = PathTraverse;
+    _RemoveNode = REMOVE_NODE;
+
+    new = Store;
+})

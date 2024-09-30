@@ -1,13 +1,13 @@
 local RunService = game:GetService("RunService")
 local IsClient = RunService:IsClient()
 
-local Cleaner = require(script.Parent.Parent:WaitForChild("Cleaner"))
-local TypeGuard = require(script.Parent.Parent:WaitForChild("TypeGuard"))
-local StoreInterface = require(script.Parent:WaitForChild("StoreInterface"))
-local ReplicatedStore = require(script.Parent:WaitForChild("ReplicatedStore"))
+local ReplicatedStore = require(script.Parent.ReplicatedStore)
+local StoreInterface = require(script.Parent.StoreInterface)
+local TypeGuard = require(script.Parent.Parent.TypeGuard)
+local Cleaner = require(script.Parent.Parent.Cleaner)
 
 local VALIDATE_PARAMS = true
-local REMOTE_WAIT_TIMEOUT = 120
+local REMOTE_WAIT_TIMEOUT = 240
 
 local TYPE_INSTANCE = "Instance"
 local TYPE_REMOTE_EVENT = "RemoteEvent"
@@ -19,7 +19,6 @@ local ERR_ROOT_DEPARENTED = "Instance was already deparented"
 local Cache = {}
 
 local ClientParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), TypeGuard.Boolean():Optional())
-
 local function Client<T>(Root: Instance, PartitionName: string, ShouldYieldOnRemove: boolean?): (StoreInterface.Type<T>, ReplicatedStore.ReplicatedStore)
     if (VALIDATE_PARAMS) then
         ClientParams(Root, PartitionName, ShouldYieldOnRemove)
@@ -30,7 +29,6 @@ local function Client<T>(Root: Instance, PartitionName: string, ShouldYieldOnRem
     assert(Root:IsDescendantOf(game), ERR_ROOT_DEPARENTED)
 
     local Cached = Cache[Remote]
-
     if (Cached) then
         return unpack(Cached)
     end
@@ -38,33 +36,26 @@ local function Client<T>(Root: Instance, PartitionName: string, ShouldYieldOnRem
     local CleanerObject = Cleaner.new()
 
     local ReplicationObject = ReplicatedStore.new(Remote, false)
-    ReplicationObject:InitClient()
+    ReplicationObject.InitClient()
     CleanerObject:Add(ReplicationObject)
-
-    local Interface = StoreInterface.new(ReplicationObject)
-    local CurrentLocation = Remote:GetFullName()
 
     CleanerObject:Add(Remote.AncestryChanged:Connect(function()
         if (ShouldYieldOnRemove) then
             task.wait()
         end
 
-        if (Remote:IsDescendantOf(game)) then
-            CurrentLocation = Remote:GetFullName()
-        else
-            print("[InstanceReplication] Remote deparented: " .. CurrentLocation)
+        if (not Remote:IsDescendantOf(game)) then
             Cache[Remote] = nil
             CleanerObject:Clean()
         end
     end))
 
+    local Interface = StoreInterface.new(ReplicationObject)
     Cache[Remote] = {Interface, ReplicationObject}
-
     return Interface, ReplicationObject
 end
 
 local ServerParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), (TypeGuard.Number():Or(TypeGuard.String("Defer"))):Optional(), TypeGuard.Boolean():Optional())
-
 local function Server<T>(Root: Instance, PartitionName: string, Interval: (number | "Defer")?, ShouldYieldOnRemove: boolean?): (StoreInterface.Type<T>, ReplicatedStore.ReplicatedStore)
     if (VALIDATE_PARAMS) then
         ServerParams(Root, PartitionName, Interval, ShouldYieldOnRemove)
@@ -73,57 +64,50 @@ local function Server<T>(Root: Instance, PartitionName: string, Interval: (numbe
     assert(typeof(Root) == TYPE_INSTANCE, ERR_ROOT_TYPE:format(typeof(Root)))
     assert(Root:IsDescendantOf(game), ERR_ROOT_DEPARENTED)
 
-    local Remote = Instance.new(TYPE_REMOTE_EVENT)
-    Remote.Name = PartitionName
+    local Remote = Root:FindFirstChild(PartitionName)
+    if (not Remote) then
+        Remote = Instance.new(TYPE_REMOTE_EVENT)
+        Remote.Name = PartitionName
+        Remote.Parent = Root
+    end
 
     local Cached = Cache[Remote]
-
     if (Cached) then
         return unpack(Cached)
     end
 
     local CleanerObject = Cleaner.new()
-    local ReplicationObject = ReplicatedStore.new(Remote, true)
+    local DeferFunction
 
     if (Interval) then
         if (Interval == "Defer") then
-            ReplicationObject.DeferFunction = function(Callback)
+            DeferFunction = function(Callback)
                 task.defer(Callback)
             end
         elseif (Interval > 0) then
-            ReplicationObject.DeferFunction = function(Callback)
+            DeferFunction = function(Callback)
                 task.delay(Interval, Callback)
             end
         end
     end
 
-    ReplicationObject:InitServer()
+    local ReplicationObject = ReplicatedStore.new(Remote, true, DeferFunction)
+    ReplicationObject.InitServer()
     CleanerObject:Add(ReplicationObject)
-
-    local Interface = StoreInterface.new(ReplicationObject)
-    local CurrentLocation = Remote:GetFullName()
-
     CleanerObject:Add(Remote.AncestryChanged:Connect(function()
-        if (Remote:IsDescendantOf(game)) then
-            CurrentLocation = Remote:GetFullName()
-        else
+        if (not Remote:IsDescendantOf(game)) then
             if (ShouldYieldOnRemove) then
                 task.wait()
             end
 
-            print("[InstanceReplication] Remote deparented: " .. CurrentLocation)
             Cache[Remote] = nil
             CleanerObject:Clean()
         end
     end))
 
-    Remote.Parent = Root
+    local Interface = StoreInterface.new(ReplicationObject)
     Cache[Remote] = {Interface, ReplicationObject}
     return Interface, ReplicationObject
 end
 
-local function Auto(...)
-    return IsClient and Client(...) or Server(...)
-end
-
-return Auto
+return (IsClient and Client or Server)
