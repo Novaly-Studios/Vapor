@@ -130,6 +130,8 @@ local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: a
             Event:Fire(nil)
             Event:Destroy()
         end
+
+        table.clear(_Awaiting)
     end
     self.Destroy = Destroy
 
