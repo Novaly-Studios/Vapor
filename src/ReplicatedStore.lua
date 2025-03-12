@@ -1,12 +1,13 @@
 --!native
 --!optimize 2
 --!nonstrict
+
 local Players = game:GetService("Players")
 
 local GeneralStore = require(script.Parent.GeneralStore)
 local TableUtil = require(script.Parent.Parent.TableUtil)
     local Map = TableUtil.Map.Map or TableUtil.Map.Map1D
-local XSignal = require(script.Parent.Parent.XSignal)
+local XSignal = require(script.Parent.Parent.XSignal).XSignal
 
 local FlatPathDelimiter = GeneralStore._FlatPathDelimiter
 local BuildFromPath = GeneralStore._BuildFromPath
@@ -81,7 +82,6 @@ end
 local function DeepCopyWithPathExceptions(Subject, Table, SendToPaths, CurrentPath)
     local SendToValue = SendToPaths[CurrentPath]
     if (SendToValue and not SendToValue[Subject]) then
-        print(">>>>>>>>>>>>>>Reject send to", CurrentPath)
         return nil
     end
 

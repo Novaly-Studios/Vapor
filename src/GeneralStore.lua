@@ -3,11 +3,11 @@
 --!nonstrict
 
 -- Allows easy command bar paste.
-if (not script) then
+if (not script and Instance) then
     script = game:GetService("ReplicatedFirst").Vapor.GeneralStore
 end
 
-local XSignal = require(script.Parent.Parent.XSignal)
+local XSignal = require(script.Parent.Parent.XSignal).XSignal
 
 export type GeneralStoreKey = string | number
 export type GeneralStoreStructure = {[GeneralStoreKey]: any}
@@ -74,7 +74,7 @@ local function InternalMerge(Into, Data)
             if (Existing == REMOVE_NODE) then
                 Existing = table.clone(REMOVE_NODE)
                 Into[Key] = Existing
-            elseif (not Existing) then
+            elseif (Existing == nil) then
                 Existing = {}
                 Into[Key] = Existing
             end
@@ -110,10 +110,10 @@ end
 
 -----------------------------------------------------------------------------------
 
-local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: any?)
+local function GeneralStore(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: any?)
     local DeferFunction = Defer
     local self = {}
-    
+
     local _ShaftedEvents = {} -- ShaftedEvents: {[string]: Signal}
     local _Structure = {}
     local _Deferring = false
@@ -385,11 +385,11 @@ local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: a
     end
     self.Clear = Clear
 
-    local SignalLock = {
+    --[[ local SignalLock = {
         __index = function(self, Key)
             error("Signal was cleaned and locked as all connections were disconnected", 2)
         end;
-    }
+    } ]]
 
     --- Creates or obtains the event corresponding to a path's value changing.
     local function _GetValueChangedSignalFlat(AwaitingPath: string, SubValue: boolean?)
@@ -401,17 +401,17 @@ local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: a
             return Event
         end
 
-        local Event = XSignal.new()
-        _Awaiting[AwaitingPath] = Event
+        local NewEvent = XSignal.new()
+        _Awaiting[AwaitingPath] = NewEvent
 
         --[[ do
             -- Posisble mode in future: registered by default, until connection count returns to 0.
             -- This way we don't necessarily maintain the signal reference until whole GeneralStore is GC'ed.
 
             local Count = 0
-            local OriginalConnect = Event.Connect
+            local OriginalConnect = NewEvent.Connect
 
-            function Event:Connect(Callback)
+            function NewEvent:Connect(Callback)
                 Count += 1
 
                 local Connection = OriginalConnect(self, Callback)
@@ -424,17 +424,17 @@ local function Store(Defer: ((Callback: (() -> ())) -> ())?, DefaultStructure: a
                         _Awaiting[AwaitingPath] = nil
                     end
 
-                    setmetatable(Event, SignalLock)
-                    if (not table.isfrozen(Event)) then
-                        table.freeze(Event)
+                    setmetatable(NewEvent, SignalLock)
+                    if (not table.isfrozen(NewEvent)) then
+                        table.freeze(NewEvent)
                     end
                 end
-                
+
                 return Connection
             end
         end ]]
 
-        return Event
+        return NewEvent
     end
 
     --- Creates or obtains the event corresponding to a path's value changing.
@@ -510,7 +510,7 @@ end
 
 --[[
     -- Example usage
-    local Test = Store()
+    local Test = GeneralStore()
     Test.SetDebugLog(true)
     Test.GetValueChangedSignal({}):Connect(function(...) print("AHHHH", ...) end)
     Test.Merge({
@@ -556,5 +556,5 @@ return table.freeze({
     _PathTraverse = PathTraverse;
     _RemoveNode = REMOVE_NODE;
 
-    new = Store;
+    new = GeneralStore;
 })

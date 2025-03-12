@@ -3,7 +3,7 @@
 --!nonstrict
 
 -- Allows easy command bar paste.
-if (not script) then
+if (not script and Instance) then
 	script = game:GetService("ReplicatedFirst").Vapor.StoreInterface
 end
 
@@ -13,6 +13,8 @@ local XSignal = require(script.Parent.Parent.XSignal)
     type XSignal<T...> = XSignal.XSignal<T...>
 local GeneralStore = require(script.Parent.GeneralStore)
     type GeneralStorePath = GeneralStore.GeneralStorePath
+
+local TYPE_TABLE = "table"
 
 local ERR_INCREMENT_NO_EXISTING_VALUE = "Invalid existing value for %s (expected number, got %s)"
 local ERR_INCREMENT_NOT_NUMBER = "Invalid argument #1 (expected number, got %s)"
@@ -157,6 +159,26 @@ function StoreInterface:Insert(...)
     local Array = self:Get()
     table.insert(Array, ...)
     self:Set(Array)
+end
+
+function StoreInterface:IsContainer()
+    return (type(self:Get()) == TYPE_TABLE)
+end
+
+function StoreInterface:IsArray()
+    return (self:IsContainer() and self:Get()[1] ~= nil)
+end
+
+function StoreInterface:IsEmpty()
+    return (self:IsContainer() and next(self:Get()) == nil)
+end
+
+function StoreInterface:IsMap()
+    return (self:IsContainer() and not self:IsArray() and next(self:Get()) ~= nil)
+end
+
+function StoreInterface:IsLeaf()
+    return (self:Get() ~= nil and not self:IsContainer())
 end
 
 function StoreInterface:GetValueChangedSignal()

@@ -31,4 +31,4 @@ function MockRemoteEvent:FireAllClients(...)
     end
 end
 
-return MockRemoteEvent
+return table.freeze(MockRemoteEvent)

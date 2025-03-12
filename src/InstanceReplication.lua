@@ -18,8 +18,12 @@ local ERR_ROOT_DEPARENTED = "Instance was already deparented"
 
 local Cache = {}
 
-local ClientParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), TypeGuard.Boolean():Optional())
-local function Client<T>(Root: Instance, PartitionName: string, ShouldYieldOnRemove: boolean?): (StoreInterface.Type<T>, ReplicatedStore.ReplicatedStore)
+local ClientParams = TypeGuard.Params(
+    TypeGuard.Instance():IsDescendantOf(game),
+    TypeGuard.String(),
+    TypeGuard.Optional(TypeGuard.Boolean())
+)
+local function Client<T>(Root: Instance, PartitionName: string, ShouldYieldOnRemove: boolean?): (StoreInterface.StandardMethods<T>, typeof(ReplicatedStore))
     if (VALIDATE_PARAMS) then
         ClientParams(Root, PartitionName, ShouldYieldOnRemove)
     end
@@ -55,8 +59,13 @@ local function Client<T>(Root: Instance, PartitionName: string, ShouldYieldOnRem
     return Interface, ReplicationObject
 end
 
-local ServerParams = TypeGuard.Params(TypeGuard.Instance():IsDescendantOf(game), TypeGuard.String(), (TypeGuard.Number():Or(TypeGuard.String("Defer"))):Optional(), TypeGuard.Boolean():Optional())
-local function Server<T>(Root: Instance, PartitionName: string, Interval: (number | "Defer")?, ShouldYieldOnRemove: boolean?): (StoreInterface.Type<T>, ReplicatedStore.ReplicatedStore)
+local ServerParams = TypeGuard.Params(
+    TypeGuard.Instance():IsDescendantOf(game),
+    TypeGuard.String(),
+    TypeGuard.Or(TypeGuard.Number(), TypeGuard.String("Defer")),
+    TypeGuard.Optional(TypeGuard.Boolean())
+)
+local function Server<T>(Root: Instance, PartitionName: string, Interval: (number | "Defer")?, ShouldYieldOnRemove: boolean?): (StoreInterface.StandardMethods<T>, typeof(ReplicatedStore))
     if (VALIDATE_PARAMS) then
         ServerParams(Root, PartitionName, Interval, ShouldYieldOnRemove)
     end

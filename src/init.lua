@@ -9,9 +9,9 @@ local StoreInterface = require(script.StoreInterface)
 local GeneralStore = require(script.GeneralStore)
     export type GeneralStoreStructure = GeneralStore.GeneralStoreStructure
 
-return {
+return table.freeze({
     InstanceReplication = InstanceReplication;
     ReplicatedStore = ReplicatedStore;
     StoreInterface = StoreInterface;
     GeneralStore = GeneralStore;
-};
+})
