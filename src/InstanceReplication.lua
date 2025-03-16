@@ -62,7 +62,7 @@ end
 local ServerParams = TypeGuard.Params(
     TypeGuard.Instance():IsDescendantOf(game),
     TypeGuard.String(),
-    TypeGuard.Or(TypeGuard.Number(), TypeGuard.String("Defer")),
+    TypeGuard.Or(TypeGuard.Number(), TypeGuard.String("Defer"), TypeGuard.Nil()),
     TypeGuard.Optional(TypeGuard.Boolean())
 )
 local function Server<T>(Root: Instance, PartitionName: string, Interval: (number | "Defer")?, ShouldYieldOnRemove: boolean?): (StoreInterface.StandardMethods<T>, typeof(ReplicatedStore))

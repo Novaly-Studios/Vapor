@@ -5,8 +5,8 @@
 local Players = game:GetService("Players")
 
 local GeneralStore = require(script.Parent.GeneralStore)
-local TableUtil = require(script.Parent.Parent.TableUtil)
-    local Map = TableUtil.Map.Map or TableUtil.Map.Map1D
+local TableUtil = require(script.Parent.Parent.TableUtil).WithFeatures()
+    local Map = TableUtil.Map.Map
 local XSignal = require(script.Parent.Parent.XSignal).XSignal
 
 local FlatPathDelimiter = GeneralStore._FlatPathDelimiter
